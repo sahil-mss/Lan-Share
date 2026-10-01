@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.lanshare_activity.db*
+.DS_Store
