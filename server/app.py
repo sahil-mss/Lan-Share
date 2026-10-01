@@ -128,12 +128,15 @@ async def broadcast_event(event_type: str, payload: Any):
 
 def get_connected_users_list() -> List[Dict[str, Any]]:
     users = []
+    now = time.time()
     for token, s in SESSIONS.items():
+        is_stale = (now - s.get("last_active", s["connected_at"])) > 45.0
         users.append({
             "client_id": s["client_id"],
             "user_name": s["user_name"],
             "is_host": s["is_host"],
             "viewing_file": s.get("viewing_file"),
+            "status": "idle" if is_stale else s.get("status", "connected"),
             "connected_at": s["connected_at"],
             "last_active": s.get("last_active", s["connected_at"])
         })
@@ -191,6 +194,7 @@ async def start_host_server(req: HostStartRequest):
     SERVER_STATE["discovery"] = disc
 
     SERVER_STATE["is_running"] = True
+    SESSIONS.clear()
 
     # Host session
     token = secrets.token_hex(24)
@@ -241,14 +245,23 @@ async def join_workspace(req: JoinRequest):
             SERVER_STATE["logger"].log_event("AUTH_FAILURE", req.user_name, "unknown", details="Invalid password attempt")
         raise HTTPException(status_code=401, detail="Incorrect workspace password.")
 
+    base_name = req.user_name.strip() or "Guest"
+    existing_names = {s["user_name"] for s in SESSIONS.values()}
+    assigned_name = base_name
+    counter = 2
+    while assigned_name in existing_names:
+        assigned_name = f"{base_name} ({counter})"
+        counter += 1
+
     token = secrets.token_hex(24)
     client_id = f"client_{secrets.token_hex(4)}"
     session_data = {
-        "user_name": req.user_name.strip() or "Guest",
+        "user_name": assigned_name,
         "client_id": client_id,
         "is_host": False,
         "connected_at": time.time(),
         "viewing_file": None,
+        "status": "connected",
         "last_active": time.time()
     }
     SESSIONS[token] = session_data
@@ -573,12 +586,15 @@ async def websocket_endpoint(websocket: WebSocket):
             action = data.get("action")
             
             if action == "PING":
-                await websocket.send_json({"type": "PONG"})
+                if token in SESSIONS:
+                    SESSIONS[token]["last_active"] = time.time()
+                await websocket.send_json({"type": "PONG", "timestamp": time.time()})
 
             elif action == "VIEW_FILE":
                 file_path = data.get("path")
                 if token in SESSIONS:
                     SESSIONS[token]["viewing_file"] = file_path
+                    SESSIONS[token]["status"] = "viewing" if file_path else "browsing"
                     SESSIONS[token]["last_active"] = time.time()
                     await broadcast_event("USERS_UPDATE", get_connected_users_list())
 

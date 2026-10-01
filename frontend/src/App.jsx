@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Folder,
   File,
-  ChevronRight,
   Monitor,
   Moon,
   Sun,
@@ -26,12 +25,17 @@ import {
   Info,
   Clock,
   AlertCircle,
+  CheckCircle,
+  AlertTriangle,
   LogOut,
   Maximize2,
   Minimize2,
   Server,
   Radio,
-  Sliders
+  Sliders,
+  X,
+  Shield,
+  SlidersHorizontal
 } from "lucide-react";
 
 // Local storage keys
@@ -59,7 +63,6 @@ export default function App() {
     }
   });
 
-  // Save layout changes
   const saveLayout = (newLayout) => {
     setLayout(newLayout);
     try {
@@ -72,15 +75,31 @@ export default function App() {
     setMaximizedPanel(null);
   };
 
-  // Connection and Session
+  // Connection State Model: "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "RECONNECTING" | "AUTHENTICATING" | "SERVER_UNAVAILABLE"
+  const [connectionStatus, setConnectionStatus] = useState("DISCONNECTED");
   const [serverUrl, setServerUrl] = useState("http://localhost:7420");
   const [token, setToken] = useState(null);
   const [session, setSession] = useState(null);
   const [workspaceInfo, setWorkspaceInfo] = useState(null);
   const [connectedUsers, setConnectedUsers] = useState([]);
   const [activityLogs, setActivityLogs] = useState([]);
-  const [isConnected, setIsConnected] = useState(false);
+  const [activityFilter, setActivityFilter] = useState("ALL"); // ALL | FILES | USERS
   const [discoveredServers, setDiscoveredServers] = useState([]);
+
+  // Toast Notifications: array of { id, type: 'info'|'success'|'warning'|'error', message }
+  const [toasts, setToasts] = useState([]);
+
+  const addToast = useCallback((message, type = "info") => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, type, message }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4500);
+  }, []);
+
+  const removeToast = (id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  };
 
   // Launcher state
   const [activeTab, setActiveTab] = useState("host"); // "host" | "join" | "discovered"
@@ -101,18 +120,16 @@ export default function App() {
   const [history, setHistory] = useState([""]);
   const [historyIdx, setHistoryIdx] = useState(0);
   const [files, setFiles] = useState([]);
-  const [selectedPaths, setSelectedPaths] = useState([]); // Multi-select array of paths
-  const [activeFile, setActiveFile] = useState(null); // Last selected file for inspection
+  const [selectedPaths, setSelectedPaths] = useState([]);
+  const [activeFile, setActiveFile] = useState(null);
   const [fileMetadata, setFileMetadata] = useState(null);
   const [filePreview, setFilePreview] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState("name");
   const [sortAsc, setSortAsc] = useState(true);
 
-  // Clipboard (Cut/Copy/Paste inside workspace)
-  const [internalClipboard, setInternalClipboard] = useState(null); // { action: "copy"|"cut", items: [...] }
-
-  // Drag and Drop State
+  // Clipboard & Drag/Drop
+  const [internalClipboard, setInternalClipboard] = useState(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [dragOverFolder, setDragOverFolder] = useState(null);
 
@@ -121,20 +138,23 @@ export default function App() {
   const [renameValue, setRenameValue] = useState("");
 
   // Context Menu & Dialogs
-  const [contextMenu, setContextMenu] = useState(null); // { x, y, item, multi }
+  const [contextMenu, setContextMenu] = useState(null);
   const [modalProperties, setModalProperties] = useState(null);
   const [modalAccessHistory, setModalAccessHistory] = useState(null);
   const [modalNewFolder, setModalNewFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
-  const [modalDeleteConfirm, setModalDeleteConfirm] = useState(null); // items to delete
-  const [maximizedPanel, setMaximizedPanel] = useState(null); // "preview" | "activity" | null
+  const [modalDeleteConfirm, setModalDeleteConfirm] = useState(null);
+  const [modalHostControl, setModalHostControl] = useState(false);
+  const [modalStopConfirm, setModalStopConfirm] = useState(false);
+  const [maximizedPanel, setMaximizedPanel] = useState(null);
 
-  // File Upload input ref
+  // Refs for WebSockets & Reconnect Exponential Backoff
   const fileInputRef = useRef(null);
   const wsRef = useRef(null);
-
-  // Resizing Refs
-  const isDraggingRef = useRef(null); // "left" | "leftVertical" | "rightVertical"
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimeoutRef = useRef(null);
+  const pingIntervalRef = useRef(null);
+  const isDraggingRef = useRef(null);
 
   // Theme application
   useEffect(() => {
@@ -167,64 +187,6 @@ export default function App() {
     return () => clearInterval(interval);
   }, [serverUrl, session]);
 
-  // Establish WebSocket upon token & server connection
-  useEffect(() => {
-    if (!token) return;
-
-    let wsProtocol = serverUrl.startsWith("https") ? "wss:" : "ws:";
-    let hostWithoutProtocol = serverUrl.replace(/^https?:\/\//, "");
-    let wsUrl = `${wsProtocol}//${hostWithoutProtocol}/ws`;
-
-    const socket = new WebSocket(wsUrl);
-    wsRef.current = socket;
-
-    socket.onopen = () => {
-      setIsConnected(true);
-      socket.send(JSON.stringify({ token }));
-    };
-
-    socket.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === "SNAPSHOT") {
-          setConnectedUsers(msg.payload.users || []);
-          setActivityLogs(msg.payload.activity || []);
-        } else if (msg.type === "USERS_UPDATE") {
-          setConnectedUsers(msg.payload);
-        } else if (msg.type === "WORKSPACE_CHANGED") {
-          // Live Realtime updates across clients
-          loadDirectory(currentPath);
-          fetchActivity();
-          // If active file was renamed or deleted, update inspector
-          if (msg.payload.action === "DELETE" && msg.payload.paths?.includes(activeFile?.path)) {
-            setActiveFile(null);
-            setFilePreview(null);
-            setFileMetadata(null);
-          }
-        } else if (msg.type === "USER_JOINED") {
-          setConnectedUsers((prev) => [...prev.filter((u) => u.client_id !== msg.payload.client_id), msg.payload]);
-          fetchActivity();
-        } else if (msg.type === "USER_LEFT") {
-          setConnectedUsers((prev) => prev.filter((u) => u.client_id !== msg.payload.client_id));
-          fetchActivity();
-        } else if (msg.type === "SERVER_STOPPED") {
-          alert("The host has stopped the workspace server.");
-          handleDisconnect();
-        }
-      } catch (e) {
-        console.error("WS message error:", e);
-      }
-    };
-
-    socket.onclose = () => {
-      setIsConnected(false);
-    };
-
-    return () => {
-      socket.close();
-    };
-  }, [token, serverUrl, currentPath, activeFile]);
-
   // Load files for directory
   const loadDirectory = useCallback(async (path) => {
     try {
@@ -253,6 +215,120 @@ export default function App() {
       }
     } catch (err) {}
   }, [serverUrl, token]);
+
+  // Robust WebSocket Connection with Exponential Backoff and Heartbeat Ping/Pong
+  const setupWebSocket = useCallback(() => {
+    if (!token) return;
+
+    let wsProtocol = serverUrl.startsWith("https") ? "wss:" : "ws:";
+    let hostWithoutProtocol = serverUrl.replace(/^https?:\/\//, "");
+    let wsUrl = `${wsProtocol}//${hostWithoutProtocol}/ws`;
+
+    if (reconnectAttemptRef.current > 0) {
+      setConnectionStatus("RECONNECTING");
+    } else {
+      setConnectionStatus("CONNECTING");
+    }
+
+    const socket = new WebSocket(wsUrl);
+    wsRef.current = socket;
+
+    socket.onopen = () => {
+      setConnectionStatus("CONNECTED");
+      reconnectAttemptRef.current = 0;
+      socket.send(JSON.stringify({ token }));
+
+      // State recovery after reconnection
+      loadDirectory(currentPath);
+      fetchActivity();
+
+      if (activeFile) {
+        // Revalidate selected file
+        fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(activeFile.path)}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        })
+          .then((r) => {
+            if (!r.ok) {
+              setActiveFile(null);
+              setFilePreview(null);
+              setFileMetadata(null);
+            }
+          })
+          .catch(() => {});
+      }
+
+      // Start 15s Heartbeat Ping
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ action: "PING" }));
+        }
+      }, 15000);
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "SNAPSHOT") {
+          setConnectedUsers(msg.payload.users || []);
+          setActivityLogs(msg.payload.activity || []);
+        } else if (msg.type === "USERS_UPDATE") {
+          setConnectedUsers(msg.payload);
+        } else if (msg.type === "WORKSPACE_CHANGED") {
+          loadDirectory(currentPath);
+          fetchActivity();
+          if (msg.payload.action === "DELETE" && msg.payload.paths?.includes(activeFile?.path)) {
+            setActiveFile(null);
+            setFilePreview(null);
+            setFileMetadata(null);
+          }
+        } else if (msg.type === "USER_JOINED") {
+          setConnectedUsers((prev) => [...prev.filter((u) => u.client_id !== msg.payload.client_id), msg.payload]);
+          fetchActivity();
+        } else if (msg.type === "USER_LEFT") {
+          setConnectedUsers((prev) => prev.filter((u) => u.client_id !== msg.payload.client_id));
+          fetchActivity();
+        } else if (msg.type === "SERVER_STOPPED") {
+          addToast("The host ended the shared workspace.", "warning");
+          handleDisconnect();
+        }
+      } catch (e) {
+        console.error("WS message parse error:", e);
+      }
+    };
+
+    socket.onclose = () => {
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      if (!token) {
+        setConnectionStatus("DISCONNECTED");
+        return;
+      }
+
+      setConnectionStatus("RECONNECTING");
+      // Exponential backoff: 1s, 2s, 4s, 8s, max 10s
+      const delay = Math.min(1000 * Math.pow(2, reconnectAttemptRef.current), 10000);
+      reconnectAttemptRef.current += 1;
+
+      reconnectTimeoutRef.current = setTimeout(() => {
+        setupWebSocket();
+      }, delay);
+    };
+
+    socket.onerror = () => {
+      socket.close();
+    };
+  }, [token, serverUrl, currentPath, activeFile, loadDirectory, fetchActivity, addToast]);
+
+  useEffect(() => {
+    if (token) {
+      setupWebSocket();
+    }
+    return () => {
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [token, setupWebSocket]);
 
   // Navigate folder
   const navigateTo = (path) => {
@@ -287,7 +363,7 @@ export default function App() {
     navigateTo(parts.join("/"));
   };
 
-  // Select and Preview File (with Multi-Select support)
+  // Select and Preview File
   const handleSelectFile = async (item, event = {}) => {
     const isCtrl = event.ctrlKey || event.metaKey;
     const isShift = event.shiftKey;
@@ -323,7 +399,6 @@ export default function App() {
       return;
     }
 
-    // Broadcast viewing file via WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ action: "VIEW_FILE", path: item.path }));
     }
@@ -346,7 +421,6 @@ export default function App() {
     }
   };
 
-  // Select all (Ctrl+A)
   const handleSelectAll = () => {
     setSelectedPaths(filteredFiles.map((f) => f.path));
   };
@@ -355,7 +429,6 @@ export default function App() {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (!session) return;
-      // If typing in input, ignore
       if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
 
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
@@ -394,6 +467,7 @@ export default function App() {
   const handleHostServer = async (e) => {
     e.preventDefault();
     setErrorMessage("");
+    setConnectionStatus("AUTHENTICATING");
     try {
       const res = await fetch(`${serverUrl}/api/host/start`, {
         method: "POST",
@@ -412,9 +486,12 @@ export default function App() {
       setToken(data.token);
       setSession(data.session);
       setWorkspaceInfo(data.status);
+      addToast(`Hosted workspace "${workspaceName}" online`, "success");
       loadDirectory("");
     } catch (err) {
+      setConnectionStatus("DISCONNECTED");
       setErrorMessage(err.message);
+      addToast(`Error hosting: ${err.message}`, "error");
     }
   };
 
@@ -427,6 +504,7 @@ export default function App() {
       target = `http://${target}`;
     }
     setServerUrl(target);
+    setConnectionStatus("AUTHENTICATING");
 
     try {
       const res = await fetch(`${target}/api/join`, {
@@ -443,6 +521,7 @@ export default function App() {
       setToken(data.token);
       setSession(data.session);
       setWorkspaceInfo({ workspace_name: data.workspace_name, host_name: data.host_name });
+      addToast(`Connected to ${data.workspace_name} as ${data.session.user_name}`, "success");
 
       const fRes = await fetch(`${target}/api/files?path=`, {
         headers: { Authorization: `Bearer ${data.token}` }
@@ -453,10 +532,13 @@ export default function App() {
         setCurrentPath("");
       }
     } catch (err) {
+      setConnectionStatus("DISCONNECTED");
       setErrorMessage(err.message);
+      addToast(`Join failed: ${err.message}`, "error");
     }
   };
 
+  // Leave / Disconnect
   const handleDisconnect = async () => {
     try {
       if (token) {
@@ -468,11 +550,30 @@ export default function App() {
     } catch (e) {}
     setToken(null);
     setSession(null);
+    setConnectionStatus("DISCONNECTED");
     setSelectedPaths([]);
     setActiveFile(null);
     setFilePreview(null);
     setFileMetadata(null);
     setFiles([]);
+  };
+
+  // Stop Server (Host only)
+  const handleStopHostServer = async () => {
+    try {
+      const res = await fetch(`${serverUrl}/api/host/stop`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        addToast("Workspace server stopped", "info");
+        setModalStopConfirm(false);
+        setModalHostControl(false);
+        handleDisconnect();
+      }
+    } catch (err) {
+      addToast(`Failed to stop server: ${err.message}`, "error");
+    }
   };
 
   // --- CRUD File Operations ---
@@ -494,12 +595,13 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to create folder");
+      addToast(`Folder "${newFolderName.trim()}" created`, "success");
       setModalNewFolder(false);
       setNewFolderName("");
       loadDirectory(currentPath);
       fetchActivity();
     } catch (err) {
-      alert(err.message);
+      addToast(err.message, "error");
     }
   };
 
@@ -522,11 +624,12 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to rename");
+      addToast(`Renamed to "${newName.trim()}"`, "success");
       setRenamingPath(null);
       loadDirectory(currentPath);
       fetchActivity();
     } catch (err) {
-      alert(err.message);
+      addToast(err.message, "error");
       setRenamingPath(null);
     }
   };
@@ -545,32 +648,36 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to delete");
+      addToast(`Deleted ${paths.length} item(s)`, "info");
       setModalDeleteConfirm(null);
       setSelectedPaths([]);
       setActiveFile(null);
       loadDirectory(currentPath);
       fetchActivity();
     } catch (err) {
-      alert(err.message);
+      addToast(err.message, "error");
     }
   };
 
   const handleUploadFiles = async (fileList) => {
     if (!fileList || fileList.length === 0) return;
+    let successCount = 0;
     for (let i = 0; i < fileList.length; i++) {
       const f = fileList[i];
       const formData = new FormData();
       formData.append("file", f);
       try {
-        await fetch(`${serverUrl}/api/file/upload?parent_path=${encodeURIComponent(currentPath)}`, {
+        const res = await fetch(`${serverUrl}/api/file/upload?parent_path=${encodeURIComponent(currentPath)}`, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}` },
           body: formData
         });
+        if (res.ok) successCount += 1;
       } catch (err) {
         console.error("Upload error:", err);
       }
     }
+    addToast(`Uploaded ${successCount} file(s)`, "success");
     loadDirectory(currentPath);
     fetchActivity();
   };
@@ -580,6 +687,7 @@ export default function App() {
     const items = files.filter((f) => selectedPaths.includes(f.path));
     if (items.length > 0) {
       setInternalClipboard({ action: "copy", items });
+      addToast(`Copied ${items.length} item(s) to clipboard`, "info");
     }
   };
 
@@ -587,6 +695,7 @@ export default function App() {
     const items = files.filter((f) => selectedPaths.includes(f.path));
     if (items.length > 0) {
       setInternalClipboard({ action: "cut", items });
+      addToast(`Cut ${items.length} item(s)`, "info");
     }
   };
 
@@ -613,6 +722,7 @@ export default function App() {
         });
       }
     }
+    addToast(`Pasted ${internalClipboard.items.length} item(s)`, "success");
     if (internalClipboard.action === "cut") {
       setInternalClipboard(null);
     }
@@ -620,7 +730,7 @@ export default function App() {
     fetchActivity();
   };
 
-  // Drag and Drop (Move internal file into folder)
+  // Drag and Drop
   const handleDragStart = (e, item) => {
     e.dataTransfer.setData("application/json", JSON.stringify(item));
   };
@@ -647,6 +757,7 @@ export default function App() {
         })
       });
       if (res.ok) {
+        addToast(`Moved ${sourceItem.name} into ${targetFolder.name}`, "success");
         loadDirectory(currentPath);
         fetchActivity();
       }
@@ -655,7 +766,6 @@ export default function App() {
     }
   };
 
-  // Drag & drop upload files from OS desktop/folder into workspace
   const handleContainerDrop = (e) => {
     e.preventDefault();
     setIsDragOver(false);
@@ -690,7 +800,7 @@ export default function App() {
       } catch (e) {}
     }
     fetchActivity();
-    alert(`Tracked ${list.length} item(s) for local synchronization at:\n${defaultLocalBase}`);
+    addToast(`Tracked ${list.length} file(s) for local copy at ${defaultLocalBase}`, "info");
   };
 
   // Interactive Resizer Event Handlers
@@ -707,7 +817,7 @@ export default function App() {
         const newWidth = Math.max(260, Math.min(e.clientX, window.innerWidth - 300));
         saveLayout({ ...layout, leftWidth: newWidth });
       } else if (isDraggingRef.current === "leftVertical") {
-        const containerHeight = window.innerHeight - 38 - 38; // titlebar + toolbar
+        const containerHeight = window.innerHeight - 38 - 38;
         const offsetTop = 76;
         const currentY = e.clientY - offsetTop;
         const newPeopleHeight = Math.max(120, Math.min(containerHeight - currentY, containerHeight - 150));
@@ -751,7 +861,14 @@ export default function App() {
       return 0;
     });
 
-  // Deep Breadcrumb Collapse (… for > 3 nested levels)
+  // Filtered Activity
+  const filteredActivityLogs = activityLogs.filter((log) => {
+    if (activityFilter === "FILES") return log.file_path != null;
+    if (activityFilter === "USERS") return log.event_type.startsWith("USER_") || log.event_type.startsWith("AUTH_");
+    return true;
+  });
+
+  // Deep Breadcrumb Collapse
   const breadcrumbSegments = currentPath.split("/").filter(Boolean);
   const renderBreadcrumbs = () => {
     if (breadcrumbSegments.length <= 3) {
@@ -768,7 +885,6 @@ export default function App() {
       });
     }
 
-    // Collapse intermediate path
     const first = breadcrumbSegments[0];
     const lastTwo = breadcrumbSegments.slice(-2);
     return (
@@ -795,8 +911,43 @@ export default function App() {
     );
   };
 
+  // Connection Indicator visual style
+  const getConnectionIndicator = () => {
+    switch (connectionStatus) {
+      case "CONNECTED":
+        return { dotClass: "connected", label: "Connected", icon: null };
+      case "RECONNECTING":
+        return { dotClass: "reconnecting", label: "Reconnecting...", icon: <RefreshCw size={11} className="spin" /> };
+      case "CONNECTING":
+      case "AUTHENTICATING":
+        return { dotClass: "connecting", label: "Connecting...", icon: null };
+      case "SERVER_UNAVAILABLE":
+      case "DISCONNECTED":
+      default:
+        return { dotClass: "disconnected", label: "Disconnected", icon: null };
+    }
+  };
+
+  const connState = getConnectionIndicator();
+
   return (
     <div className="app-container" onClick={() => setContextMenu(null)}>
+      {/* Toast Notifications */}
+      <div className="toast-container">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast-item ${t.type}`}>
+            {t.type === "success" && <CheckCircle size={15} color="var(--status-green)" />}
+            {t.type === "warning" && <AlertTriangle size={15} color="var(--status-amber)" />}
+            {t.type === "error" && <AlertCircle size={15} color="var(--status-red)" />}
+            {t.type === "info" && <Info size={15} color="var(--text-secondary)" />}
+            <span className="toast-message">{t.message}</span>
+            <button className="toast-close" onClick={() => removeToast(t.id)}>
+              <X size={13} />
+            </button>
+          </div>
+        ))}
+      </div>
+
       {/* Hidden File Input for Upload */}
       <input
         type="file"
@@ -817,16 +968,24 @@ export default function App() {
         <div className="top-actions">
           {session ? (
             <div className="status-pill">
-              <span className={`status-dot ${isConnected ? "connected" : "disconnected"}`} />
-              <span>{isConnected ? "LAN Connected" : "Reconnecting..."}</span>
+              <span className={`status-dot ${connState.dotClass}`} />
+              {connState.icon}
+              <span>{connState.label}</span>
               <span>•</span>
-              <span>{session.user_name} ({session.is_host ? "Host" : "User"})</span>
+              <span>{session.user_name}</span>
+              {session.is_host && <span className="brand-badge">HOST</span>}
             </div>
           ) : (
             <div className="status-pill">
               <Radio size={12} />
               <span>Ready</span>
             </div>
+          )}
+
+          {session?.is_host && (
+            <button className="btn-icon" title="Host Server Controls" onClick={() => setModalHostControl(true)}>
+              <Shield size={14} />
+            </button>
           )}
 
           {session && (
@@ -1045,7 +1204,6 @@ export default function App() {
 
               <div style={{ height: "16px", width: "1px", backgroundColor: "var(--border-light)", margin: "0 4px" }} />
 
-              {/* CRUD Action Buttons */}
               <button className="btn-secondary" style={{ padding: "3px 8px", fontSize: "12px" }} onClick={() => setModalNewFolder(true)}>
                 <FolderPlus size={13} /> New Folder
               </button>
@@ -1205,7 +1363,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Horizontal Splitter (Between Files & People) */}
+              {/* Horizontal Splitter */}
               <div
                 className="splitter-horizontal"
                 onMouseDown={handleMouseDownSplitter("leftVertical")}
@@ -1220,35 +1378,38 @@ export default function App() {
                   </span>
                 </div>
                 <div className="panel-content" style={{ padding: "6px 8px" }}>
-                  {connectedUsers.map((u) => (
-                    <div
-                      key={u.client_id}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        padding: "6px 8px",
-                        borderBottom: "1px solid var(--border-light)"
-                      }}
-                    >
-                      <div>
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: 500 }}>
-                          <span className="status-dot connected" />
-                          <span>{u.user_name}</span>
-                          {u.is_host && <span className="brand-badge">HOST</span>}
+                  {connectedUsers.map((u) => {
+                    const isUserViewing = u.status === "viewing" && u.viewing_file;
+                    return (
+                      <div
+                        key={u.client_id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          padding: "6px 8px",
+                          borderBottom: "1px solid var(--border-light)"
+                        }}
+                      >
+                        <div>
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: 500 }}>
+                            <span className={`status-dot ${u.status === "idle" ? "reconnecting" : "connected"}`} />
+                            <span>{u.user_name}</span>
+                            {u.is_host && <span className="brand-badge">HOST</span>}
+                          </div>
+                          <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+                            {isUserViewing ? `Viewing: ${u.viewing_file}` : u.status === "idle" ? "Inactive" : "Browsing workspace"}
+                          </div>
                         </div>
-                        <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
-                          {u.viewing_file ? `Viewing: ${u.viewing_file}` : "Browsing files"}
-                        </div>
+                        <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Read-only</span>
                       </div>
-                      <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Read</span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>
 
-            {/* Vertical Splitter (Between Left Column and Right Column) */}
+            {/* Vertical Splitter */}
             {maximizedPanel !== "preview" && (
               <div
                 className="splitter-vertical"
@@ -1299,7 +1460,7 @@ export default function App() {
                         {fileMetadata?.current_viewers && fileMetadata.current_viewers.length > 0 && (
                           <div style={{ display: "flex", alignItems: "center", gap: "6px", backgroundColor: "var(--bg-surface)", padding: "3px 8px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", fontSize: "11px" }}>
                             <Users size={12} color="var(--status-green)" />
-                            <span>Viewing:</span>
+                            <span>Currently Viewing:</span>
                             <strong>{fileMetadata.current_viewers.map((v) => v.user_name).join(", ")}</strong>
                           </div>
                         )}
@@ -1353,19 +1514,46 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Horizontal Splitter (Between Preview & Activity) */}
+              {/* Horizontal Splitter */}
               <div
                 className="splitter-horizontal"
                 onMouseDown={handleMouseDownSplitter("rightVertical")}
                 title="Drag to resize Activity panel"
               />
 
-              {/* Realtime Activity Panel */}
+              {/* Realtime Activity Panel with Filter */}
               <div className="panel-container" style={{ height: `${layout.activityHeight}px`, flexShrink: 0 }}>
                 <div className="panel-header">
-                  <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                    <Activity size={13} /> Realtime Activity
-                  </span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                      <Activity size={13} /> Realtime Activity
+                    </span>
+                    {/* Activity Filter Tabs */}
+                    <div style={{ display: "flex", gap: "2px", marginLeft: "10px" }}>
+                      <button
+                        className={`btn-icon ${activityFilter === "ALL" ? "active" : ""}`}
+                        style={{ padding: "1px 6px", fontSize: "10px" }}
+                        onClick={() => setActivityFilter("ALL")}
+                      >
+                        All
+                      </button>
+                      <button
+                        className={`btn-icon ${activityFilter === "FILES" ? "active" : ""}`}
+                        style={{ padding: "1px 6px", fontSize: "10px" }}
+                        onClick={() => setActivityFilter("FILES")}
+                      >
+                        Files
+                      </button>
+                      <button
+                        className={`btn-icon ${activityFilter === "USERS" ? "active" : ""}`}
+                        style={{ padding: "1px 6px", fontSize: "10px" }}
+                        onClick={() => setActivityFilter("USERS")}
+                      >
+                        Users
+                      </button>
+                    </div>
+                  </div>
+
                   <button
                     className="btn-icon"
                     title={maximizedPanel === "activity" ? "Restore" : "Maximize"}
@@ -1375,7 +1563,7 @@ export default function App() {
                   </button>
                 </div>
                 <div className="panel-content" style={{ padding: "4px 8px" }}>
-                  {activityLogs.map((log) => (
+                  {filteredActivityLogs.map((log) => (
                     <div
                       key={log.id}
                       style={{
@@ -1394,6 +1582,11 @@ export default function App() {
                       <span style={{ color: "var(--text-secondary)" }}>{formatEventDesc(log)}</span>
                     </div>
                   ))}
+                  {filteredActivityLogs.length === 0 && (
+                    <div style={{ textAlign: "center", padding: "16px", color: "var(--text-muted)", fontSize: "11px" }}>
+                      No activity events recorded yet.
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1527,7 +1720,6 @@ export default function App() {
               </div>
             </>
           ) : (
-            /* Multi-Selection Context Actions */
             <>
               <div
                 className="context-item"
@@ -1576,6 +1768,84 @@ export default function App() {
               </div>
             </>
           )}
+        </div>
+      )}
+
+      {/* Host Controls Dialog */}
+      {modalHostControl && (
+        <div className="modal-overlay" onClick={() => setModalHostControl(false)}>
+          <div className="modal-window" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <Shield size={15} /> Host Server Management
+              </span>
+            </div>
+            <div className="modal-body">
+              <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "8px", fontSize: "12px", marginBottom: "16px" }}>
+                <span style={{ color: "var(--text-muted)" }}>Server Status:</span>
+                <span style={{ fontWeight: 600, color: "var(--status-green)" }}>RUNNING</span>
+
+                <span style={{ color: "var(--text-muted)" }}>Workspace:</span>
+                <span>{workspaceName}</span>
+
+                <span style={{ color: "var(--text-muted)" }}>Local Address:</span>
+                <span>{serverUrl}</span>
+
+                <span style={{ color: "var(--text-muted)" }}>Connected Users:</span>
+                <span>{connectedUsers.length}</span>
+
+                <span style={{ color: "var(--text-muted)" }}>UDP Discovery:</span>
+                <span>Port 7421 (Active)</span>
+              </div>
+
+              <button
+                className="btn-primary"
+                style={{ width: "100%", justifyContent: "center", backgroundColor: "var(--status-red)", borderColor: "var(--status-red)" }}
+                onClick={() => {
+                  setModalHostControl(false);
+                  setModalStopConfirm(true);
+                }}
+              >
+                Stop Server
+              </button>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalHostControl(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Stop Server Confirmation */}
+      {modalStopConfirm && (
+        <div className="modal-overlay" onClick={() => setModalStopConfirm(false)}>
+          <div className="modal-window" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>Stop LANShare Server?</span>
+            </div>
+            <div className="modal-body">
+              <p style={{ marginBottom: "8px" }}>
+                Stopping the server will immediately disconnect all {connectedUsers.length} connected user(s).
+              </p>
+              <p style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                Other computers on your local network will no longer be able to browse this folder.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalStopConfirm(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                style={{ backgroundColor: "var(--status-red)", borderColor: "var(--status-red)" }}
+                onClick={handleStopHostServer}
+              >
+                Stop Server
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

@@ -54,6 +54,9 @@ def api_get(endpoint, token=None):
 def test_phase2a_crud():
     # Setup test workspace folder
     p = Path(TEST_ROOT)
+    if p.exists():
+        import shutil
+        shutil.rmtree(p, ignore_errors=True)
     p.mkdir(parents=True, exist_ok=True)
     (p / "initial.txt").write_text("initial content", encoding="utf-8")
 
