@@ -3,6 +3,7 @@
    - Pure neutral OS / desktop file-manager visual language
    - NO blue gradient backgrounds, NO blue shaded backgrounds, NO giant cards, NO neon
    - Subtle borders, crisp typography, clean row-based file explorer
+   - Interactive Splitters & Draggable Dividers
 */
 
 :root {
@@ -355,7 +356,7 @@ input, button, select, textarea {
   border-color: var(--border-medium);
 }
 
-/* Main Workspace Splitter Layout */
+/* Main Workspace Resizable Layout */
 .workspace-container {
   flex: 1;
   display: flex;
@@ -406,7 +407,7 @@ input, button, select, textarea {
   border-radius: var(--radius-sm);
   padding: 3px 8px;
   gap: 6px;
-  width: 200px;
+  width: 180px;
 }
 .toolbar-search input {
   border: none;
@@ -416,22 +417,62 @@ input, button, select, textarea {
   width: 100%;
 }
 
-/* 4-Panel Grid */
-.panels-main {
+/* Workspace Splitter Columns */
+.workspace-body {
   flex: 1;
-  display: grid;
-  grid-template-columns: 340px 1fr;
-  grid-template-rows: 1fr 220px;
+  display: flex;
   overflow: hidden;
+  position: relative;
+}
+
+.workspace-col-left {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+}
+
+.workspace-col-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+}
+
+/* Splitters / Draggable Dividers */
+.splitter-vertical {
+  width: 5px;
+  background-color: var(--border-light);
+  cursor: col-resize;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease;
+  z-index: 10;
+}
+.splitter-vertical:hover,
+.splitter-vertical.active {
+  background-color: var(--border-dark);
+}
+
+.splitter-horizontal {
+  height: 5px;
+  background-color: var(--border-light);
+  cursor: row-resize;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease;
+  z-index: 10;
+}
+.splitter-horizontal:hover,
+.splitter-horizontal.active {
+  background-color: var(--border-dark);
 }
 
 .panel-container {
   display: flex;
   flex-direction: column;
   background-color: var(--bg-surface);
-  border-right: 1px solid var(--border-light);
-  border-bottom: 1px solid var(--border-light);
   overflow: hidden;
+  position: relative;
 }
 
 .panel-header {
@@ -498,11 +539,41 @@ input, button, select, textarea {
   background-color: var(--bg-selected);
   color: var(--text-primary);
 }
+.file-row.drag-over {
+  background-color: var(--bg-hover);
+  outline: 2px dashed var(--border-dark);
+}
 
 .file-name-cell {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* Inline Rename Input */
+.inline-rename-input {
+  padding: 2px 6px;
+  font-size: var(--font-size-base);
+  border: 1px solid var(--border-dark);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  outline: none;
+  width: 100%;
+  max-width: 260px;
+}
+
+/* Drag overlay for drop uploading */
+.drop-zone-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: rgba(0, 0, 0, 0.08);
+  border: 2px dashed var(--border-dark);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  pointer-events: none;
 }
 
 /* Inspector / Preview */
@@ -537,7 +608,7 @@ input, button, select, textarea {
   border: 1px solid var(--border-medium);
   border-radius: var(--radius-sm);
   box-shadow: 0 4px 14px rgba(0,0,0,0.12);
-  min-width: 170px;
+  min-width: 180px;
   padding: 4px 0;
   z-index: 1000;
 }

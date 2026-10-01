@@ -1,12 +1,8 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Folder,
   File,
-  FileCode,
-  FileText,
-  Image as ImageIcon,
   ChevronRight,
-  ChevronDown,
   Monitor,
   Moon,
   Sun,
@@ -20,27 +16,62 @@ import {
   Activity,
   Download,
   FolderOpen,
+  FolderPlus,
+  Upload,
+  Trash2,
+  Edit2,
+  Copy,
+  Scissors,
+  Clipboard,
   Info,
   Clock,
-  CheckCircle,
   AlertCircle,
-  Copy,
   LogOut,
   Maximize2,
   Minimize2,
-  Lock,
+  Server,
   Radio,
-  Server
+  Sliders
 } from "lucide-react";
 
 // Local storage keys
 const STORAGE_THEME = "lanshare_theme";
 const STORAGE_LOCAL_ROOT = "lanshare_local_dir";
+const STORAGE_LAYOUT = "lanshare_panel_layout_v1";
+
+const DEFAULT_LAYOUT = {
+  leftWidth: 380,
+  peopleHeight: 180,
+  activityHeight: 190
+};
 
 export default function App() {
   // Theme state: "system" | "light" | "dark"
   const [theme, setTheme] = useState(() => localStorage.getItem(STORAGE_THEME) || "system");
-  
+
+  // Layout state with persistence
+  const [layout, setLayout] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_LAYOUT);
+      return saved ? JSON.parse(saved) : DEFAULT_LAYOUT;
+    } catch {
+      return DEFAULT_LAYOUT;
+    }
+  });
+
+  // Save layout changes
+  const saveLayout = (newLayout) => {
+    setLayout(newLayout);
+    try {
+      localStorage.setItem(STORAGE_LAYOUT, JSON.stringify(newLayout));
+    } catch {}
+  };
+
+  const resetLayout = () => {
+    saveLayout(DEFAULT_LAYOUT);
+    setMaximizedPanel(null);
+  };
+
   // Connection and Session
   const [serverUrl, setServerUrl] = useState("http://localhost:7420");
   const [token, setToken] = useState(null);
@@ -70,21 +101,40 @@ export default function App() {
   const [history, setHistory] = useState([""]);
   const [historyIdx, setHistoryIdx] = useState(0);
   const [files, setFiles] = useState([]);
-  const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedPaths, setSelectedPaths] = useState([]); // Multi-select array of paths
+  const [activeFile, setActiveFile] = useState(null); // Last selected file for inspection
   const [fileMetadata, setFileMetadata] = useState(null);
   const [filePreview, setFilePreview] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState("name");
   const [sortAsc, setSortAsc] = useState(true);
 
+  // Clipboard (Cut/Copy/Paste inside workspace)
+  const [internalClipboard, setInternalClipboard] = useState(null); // { action: "copy"|"cut", items: [...] }
+
+  // Drag and Drop State
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [dragOverFolder, setDragOverFolder] = useState(null);
+
+  // Inline Rename
+  const [renamingPath, setRenamingPath] = useState(null);
+  const [renameValue, setRenameValue] = useState("");
+
   // Context Menu & Dialogs
-  const [contextMenu, setContextMenu] = useState(null); // {x, y, item}
+  const [contextMenu, setContextMenu] = useState(null); // { x, y, item, multi }
   const [modalProperties, setModalProperties] = useState(null);
   const [modalAccessHistory, setModalAccessHistory] = useState(null);
+  const [modalNewFolder, setModalNewFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [modalDeleteConfirm, setModalDeleteConfirm] = useState(null); // items to delete
   const [maximizedPanel, setMaximizedPanel] = useState(null); // "preview" | "activity" | null
 
-  // WebSocket ref
+  // File Upload input ref
+  const fileInputRef = useRef(null);
   const wsRef = useRef(null);
+
+  // Resizing Refs
+  const isDraggingRef = useRef(null); // "left" | "leftVertical" | "rightVertical"
 
   // Theme application
   useEffect(() => {
@@ -110,9 +160,7 @@ export default function App() {
             setDiscoveredServers(data.discovered_lan_workspaces);
           }
         }
-      } catch (err) {
-        // server might not be running locally yet
-      }
+      } catch (err) {}
     };
     checkStatus();
     const interval = setInterval(checkStatus, 3000);
@@ -143,23 +191,28 @@ export default function App() {
           setActivityLogs(msg.payload.activity || []);
         } else if (msg.type === "USERS_UPDATE") {
           setConnectedUsers(msg.payload);
+        } else if (msg.type === "WORKSPACE_CHANGED") {
+          // Live Realtime updates across clients
+          loadDirectory(currentPath);
+          fetchActivity();
+          // If active file was renamed or deleted, update inspector
+          if (msg.payload.action === "DELETE" && msg.payload.paths?.includes(activeFile?.path)) {
+            setActiveFile(null);
+            setFilePreview(null);
+            setFileMetadata(null);
+          }
         } else if (msg.type === "USER_JOINED") {
           setConnectedUsers((prev) => [...prev.filter((u) => u.client_id !== msg.payload.client_id), msg.payload]);
-          setActivityLogs((prev) => [{
-            id: Date.now(),
-            timestamp: msg.timestamp,
-            event_type: "USER_JOINED",
-            user_name: msg.payload.user_name,
-            file_path: null
-          }, ...prev]);
+          fetchActivity();
         } else if (msg.type === "USER_LEFT") {
           setConnectedUsers((prev) => prev.filter((u) => u.client_id !== msg.payload.client_id));
+          fetchActivity();
         } else if (msg.type === "SERVER_STOPPED") {
           alert("The host has stopped the workspace server.");
           handleDisconnect();
         }
       } catch (e) {
-        console.error("WS error:", e);
+        console.error("WS message error:", e);
       }
     };
 
@@ -170,10 +223,10 @@ export default function App() {
     return () => {
       socket.close();
     };
-  }, [token, serverUrl]);
+  }, [token, serverUrl, currentPath, activeFile]);
 
   // Load files for directory
-  const loadDirectory = async (path) => {
+  const loadDirectory = useCallback(async (path) => {
     try {
       const res = await fetch(`${serverUrl}/api/files?path=${encodeURIComponent(path)}`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -186,13 +239,25 @@ export default function App() {
       setFiles(data.items);
       setCurrentPath(data.current_path);
     } catch (err) {
-      alert(err.message);
+      console.error(err);
     }
-  };
+  }, [serverUrl, token]);
+
+  const fetchActivity = useCallback(async () => {
+    try {
+      const res = await fetch(`${serverUrl}/api/activity`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setActivityLogs(await res.json());
+      }
+    } catch (err) {}
+  }, [serverUrl, token]);
 
   // Navigate folder
   const navigateTo = (path) => {
     loadDirectory(path);
+    setSelectedPaths([]);
     const newHist = history.slice(0, historyIdx + 1);
     newHist.push(path);
     setHistory(newHist);
@@ -222,12 +287,43 @@ export default function App() {
     navigateTo(parts.join("/"));
   };
 
-  // Select and Preview File
-  const handleSelectFile = async (item) => {
-    setSelectedFile(item);
-    if (item.is_dir) return;
+  // Select and Preview File (with Multi-Select support)
+  const handleSelectFile = async (item, event = {}) => {
+    const isCtrl = event.ctrlKey || event.metaKey;
+    const isShift = event.shiftKey;
 
-    // Send view action via WS
+    let newSelected = [];
+    if (isCtrl) {
+      if (selectedPaths.includes(item.path)) {
+        newSelected = selectedPaths.filter((p) => p !== item.path);
+      } else {
+        newSelected = [...selectedPaths, item.path];
+      }
+    } else if (isShift && selectedPaths.length > 0) {
+      const lastSelected = selectedPaths[selectedPaths.length - 1];
+      const fromIdx = filteredFiles.findIndex((f) => f.path === lastSelected);
+      const toIdx = filteredFiles.findIndex((f) => f.path === item.path);
+      if (fromIdx !== -1 && toIdx !== -1) {
+        const start = Math.min(fromIdx, toIdx);
+        const end = Math.max(fromIdx, toIdx);
+        newSelected = Array.from(new Set([...selectedPaths, ...filteredFiles.slice(start, end + 1).map((f) => f.path)]));
+      } else {
+        newSelected = [item.path];
+      }
+    } else {
+      newSelected = [item.path];
+    }
+
+    setSelectedPaths(newSelected);
+    setActiveFile(item);
+
+    if (item.is_dir) {
+      setFilePreview(null);
+      setFileMetadata(null);
+      return;
+    }
+
+    // Broadcast viewing file via WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ action: "VIEW_FILE", path: item.path }));
     }
@@ -244,24 +340,55 @@ export default function App() {
 
       if (metaRes.ok) setFileMetadata(await metaRes.json());
       if (prevRes.ok) setFilePreview(await prevRes.json());
-
-      // Refresh activity list
       fetchActivity();
     } catch (err) {
       console.error(err);
     }
   };
 
-  const fetchActivity = async () => {
-    try {
-      const res = await fetch(`${serverUrl}/api/activity`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        setActivityLogs(await res.json());
-      }
-    } catch (err) {}
+  // Select all (Ctrl+A)
+  const handleSelectAll = () => {
+    setSelectedPaths(filteredFiles.map((f) => f.path));
   };
+
+  // Keyboard navigation
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (!session) return;
+      // If typing in input, ignore
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        handleSelectAll();
+      } else if (e.key === "Delete") {
+        if (selectedPaths.length > 0) {
+          const itemsToDelete = files.filter((f) => selectedPaths.includes(f.path));
+          setModalDeleteConfirm(itemsToDelete);
+        }
+      } else if (e.key === "F2") {
+        if (selectedPaths.length === 1 && activeFile) {
+          setRenamingPath(activeFile.path);
+          setRenameValue(activeFile.name);
+        }
+      } else if (e.key === "Backspace") {
+        goUp();
+      } else if (e.key === "Enter") {
+        if (selectedPaths.length === 1 && activeFile?.is_dir) {
+          navigateTo(activeFile.path);
+        }
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+        handleCopySelected();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "x") {
+        handleCutSelected();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
+        handlePaste();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [session, selectedPaths, files, activeFile, currentPath]);
 
   // Host Server submit
   const handleHostServer = async (e) => {
@@ -317,7 +444,6 @@ export default function App() {
       setSession(data.session);
       setWorkspaceInfo({ workspace_name: data.workspace_name, host_name: data.host_name });
 
-      // Fetch file directory
       const fRes = await fetch(`${target}/api/files?path=`, {
         headers: { Authorization: `Bearer ${data.token}` }
       });
@@ -331,7 +457,6 @@ export default function App() {
     }
   };
 
-  // Disconnect / Leave
   const handleDisconnect = async () => {
     try {
       if (token) {
@@ -343,38 +468,273 @@ export default function App() {
     } catch (e) {}
     setToken(null);
     setSession(null);
-    setSelectedFile(null);
+    setSelectedPaths([]);
+    setActiveFile(null);
     setFilePreview(null);
     setFileMetadata(null);
     setFiles([]);
   };
 
-  // Open Locally
-  const handleOpenLocally = async (item) => {
-    const defaultLocalBase = localStorage.getItem(STORAGE_LOCAL_ROOT) || "C:\\Users\\Sahil\\LANShare_Workspace";
-    const localTarget = `${defaultLocalBase}\\${item.path.replace(/\//g, "\\")}`;
+  // --- CRUD File Operations ---
 
-    // Trigger download & track local relationship
-    window.open(`${serverUrl}/api/file/download?path=${encodeURIComponent(item.path)}`, "_blank");
-
+  const handleCreateFolder = async (e) => {
+    e.preventDefault();
+    if (!newFolderName.trim()) return;
     try {
-      await fetch(`${serverUrl}/api/file/track_local_copy`, {
+      const res = await fetch(`${serverUrl}/api/folder/create`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
-          shared_path: item.path,
-          local_path: localTarget,
-          version_hash: fileMetadata?.hash || null
+          parent_path: currentPath,
+          folder_name: newFolderName.trim()
         })
       });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to create folder");
+      setModalNewFolder(false);
+      setNewFolderName("");
+      loadDirectory(currentPath);
       fetchActivity();
-    } catch (e) {}
-
-    alert(`Tracking local copy for:\n${item.name}\n\nLocal destination: ${localTarget}\nDistinction: This file is now tracked for future synchronization.`);
+    } catch (err) {
+      alert(err.message);
+    }
   };
+
+  const handleCommitRename = async (path, newName) => {
+    if (!newName.trim() || newName.trim() === activeFile?.name) {
+      setRenamingPath(null);
+      return;
+    }
+    try {
+      const res = await fetch(`${serverUrl}/api/file/rename`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          path,
+          new_name: newName.trim()
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to rename");
+      setRenamingPath(null);
+      loadDirectory(currentPath);
+      fetchActivity();
+    } catch (err) {
+      alert(err.message);
+      setRenamingPath(null);
+    }
+  };
+
+  const handleDeleteConfirmed = async () => {
+    if (!modalDeleteConfirm || modalDeleteConfirm.length === 0) return;
+    const paths = modalDeleteConfirm.map((i) => i.path);
+    try {
+      const res = await fetch(`${serverUrl}/api/files/delete`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ paths })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to delete");
+      setModalDeleteConfirm(null);
+      setSelectedPaths([]);
+      setActiveFile(null);
+      loadDirectory(currentPath);
+      fetchActivity();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  const handleUploadFiles = async (fileList) => {
+    if (!fileList || fileList.length === 0) return;
+    for (let i = 0; i < fileList.length; i++) {
+      const f = fileList[i];
+      const formData = new FormData();
+      formData.append("file", f);
+      try {
+        await fetch(`${serverUrl}/api/file/upload?parent_path=${encodeURIComponent(currentPath)}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: formData
+        });
+      } catch (err) {
+        console.error("Upload error:", err);
+      }
+    }
+    loadDirectory(currentPath);
+    fetchActivity();
+  };
+
+  // Copy / Cut / Paste
+  const handleCopySelected = () => {
+    const items = files.filter((f) => selectedPaths.includes(f.path));
+    if (items.length > 0) {
+      setInternalClipboard({ action: "copy", items });
+    }
+  };
+
+  const handleCutSelected = () => {
+    const items = files.filter((f) => selectedPaths.includes(f.path));
+    if (items.length > 0) {
+      setInternalClipboard({ action: "cut", items });
+    }
+  };
+
+  const handlePaste = async () => {
+    if (!internalClipboard || !internalClipboard.items.length) return;
+    for (const item of internalClipboard.items) {
+      if (internalClipboard.action === "copy") {
+        await fetch(`${serverUrl}/api/file/copy`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({ source_path: item.path, dest_parent: currentPath })
+        });
+      } else if (internalClipboard.action === "cut") {
+        await fetch(`${serverUrl}/api/file/move`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({ source_path: item.path, dest_parent: currentPath, overwrite: false })
+        });
+      }
+    }
+    if (internalClipboard.action === "cut") {
+      setInternalClipboard(null);
+    }
+    loadDirectory(currentPath);
+    fetchActivity();
+  };
+
+  // Drag and Drop (Move internal file into folder)
+  const handleDragStart = (e, item) => {
+    e.dataTransfer.setData("application/json", JSON.stringify(item));
+  };
+
+  const handleDropOnFolder = async (e, targetFolder) => {
+    e.preventDefault();
+    setDragOverFolder(null);
+    const dataStr = e.dataTransfer.getData("application/json");
+    if (!dataStr) return;
+    const sourceItem = JSON.parse(dataStr);
+    if (sourceItem.path === targetFolder.path) return;
+
+    try {
+      const res = await fetch(`${serverUrl}/api/file/move`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          source_path: sourceItem.path,
+          dest_parent: targetFolder.path,
+          overwrite: false
+        })
+      });
+      if (res.ok) {
+        loadDirectory(currentPath);
+        fetchActivity();
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Drag & drop upload files from OS desktop/folder into workspace
+  const handleContainerDrop = (e) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleUploadFiles(e.dataTransfer.files);
+    }
+  };
+
+  // Open Locally
+  const handleOpenLocally = async (items) => {
+    const list = Array.isArray(items) ? items : [items];
+    const defaultLocalBase = localStorage.getItem(STORAGE_LOCAL_ROOT) || "C:\\Users\\Sahil\\LANShare_Workspace";
+
+    for (const item of list) {
+      if (item.is_dir) continue;
+      const localTarget = `${defaultLocalBase}\\${item.path.replace(/\//g, "\\")}`;
+      window.open(`${serverUrl}/api/file/download?path=${encodeURIComponent(item.path)}`, "_blank");
+
+      try {
+        await fetch(`${serverUrl}/api/file/track_local_copy`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            shared_path: item.path,
+            local_path: localTarget,
+            version_hash: fileMetadata?.hash || null
+          })
+        });
+      } catch (e) {}
+    }
+    fetchActivity();
+    alert(`Tracked ${list.length} item(s) for local synchronization at:\n${defaultLocalBase}`);
+  };
+
+  // Interactive Resizer Event Handlers
+  const handleMouseDownSplitter = (type) => (e) => {
+    e.preventDefault();
+    isDraggingRef.current = type;
+    document.body.style.cursor = type === "left" ? "col-resize" : "row-resize";
+  };
+
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (!isDraggingRef.current) return;
+      if (isDraggingRef.current === "left") {
+        const newWidth = Math.max(260, Math.min(e.clientX, window.innerWidth - 300));
+        saveLayout({ ...layout, leftWidth: newWidth });
+      } else if (isDraggingRef.current === "leftVertical") {
+        const containerHeight = window.innerHeight - 38 - 38; // titlebar + toolbar
+        const offsetTop = 76;
+        const currentY = e.clientY - offsetTop;
+        const newPeopleHeight = Math.max(120, Math.min(containerHeight - currentY, containerHeight - 150));
+        saveLayout({ ...layout, peopleHeight: newPeopleHeight });
+      } else if (isDraggingRef.current === "rightVertical") {
+        const containerHeight = window.innerHeight - 38 - 38;
+        const offsetTop = 76;
+        const currentY = e.clientY - offsetTop;
+        const newActivityHeight = Math.max(120, Math.min(containerHeight - currentY, containerHeight - 150));
+        saveLayout({ ...layout, activityHeight: newActivityHeight });
+      }
+    };
+
+    const handleMouseUp = () => {
+      if (isDraggingRef.current) {
+        isDraggingRef.current = null;
+        document.body.style.cursor = "default";
+      }
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [layout]);
 
   // Filter and Sort files
   const filteredFiles = files
@@ -391,11 +751,61 @@ export default function App() {
       return 0;
     });
 
-  // Breadcrumbs segments
-  const breadcrumbs = currentPath.split("/").filter(Boolean);
+  // Deep Breadcrumb Collapse (… for > 3 nested levels)
+  const breadcrumbSegments = currentPath.split("/").filter(Boolean);
+  const renderBreadcrumbs = () => {
+    if (breadcrumbSegments.length <= 3) {
+      return breadcrumbSegments.map((seg, idx) => {
+        const subPath = breadcrumbSegments.slice(0, idx + 1).join("/");
+        return (
+          <React.Fragment key={subPath}>
+            <span className="crumb-sep">/</span>
+            <span className="crumb-segment" onClick={() => navigateTo(subPath)}>
+              {seg}
+            </span>
+          </React.Fragment>
+        );
+      });
+    }
+
+    // Collapse intermediate path
+    const first = breadcrumbSegments[0];
+    const lastTwo = breadcrumbSegments.slice(-2);
+    return (
+      <>
+        <span className="crumb-sep">/</span>
+        <span className="crumb-segment" onClick={() => navigateTo(first)}>
+          {first}
+        </span>
+        <span className="crumb-sep">/</span>
+        <span className="crumb-segment" title={currentPath}>…</span>
+        {lastTwo.map((seg, i) => {
+          const idx = breadcrumbSegments.length - 2 + i;
+          const subPath = breadcrumbSegments.slice(0, idx + 1).join("/");
+          return (
+            <React.Fragment key={subPath}>
+              <span className="crumb-sep">/</span>
+              <span className="crumb-segment" onClick={() => navigateTo(subPath)}>
+                {seg}
+              </span>
+            </React.Fragment>
+          );
+        })}
+      </>
+    );
+  };
 
   return (
     <div className="app-container" onClick={() => setContextMenu(null)}>
+      {/* Hidden File Input for Upload */}
+      <input
+        type="file"
+        multiple
+        ref={fileInputRef}
+        style={{ display: "none" }}
+        onChange={(e) => handleUploadFiles(e.target.files)}
+      />
+
       {/* Top Application Titlebar */}
       <header className="top-titlebar">
         <div className="brand-section">
@@ -417,6 +827,12 @@ export default function App() {
               <Radio size={12} />
               <span>Ready</span>
             </div>
+          )}
+
+          {session && (
+            <button className="btn-icon" title="Reset Panel Layout" onClick={resetLayout}>
+              <Sliders size={14} />
+            </button>
           )}
 
           {/* Theme Selector */}
@@ -614,18 +1030,34 @@ export default function App() {
           {/* Workspace Toolbar */}
           <div className="workspace-toolbar">
             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-              <button className="btn-icon" onClick={goBack} disabled={historyIdx <= 0} title="Back">
+              <button className="btn-icon" onClick={goBack} disabled={historyIdx <= 0} title="Back (Alt+Left)">
                 <ArrowLeft size={14} />
               </button>
-              <button className="btn-icon" onClick={goForward} disabled={historyIdx >= history.length - 1} title="Forward">
+              <button className="btn-icon" onClick={goForward} disabled={historyIdx >= history.length - 1} title="Forward (Alt+Right)">
                 <ArrowRight size={14} />
               </button>
-              <button className="btn-icon" onClick={goUp} disabled={!currentPath} title="Up one folder">
+              <button className="btn-icon" onClick={goUp} disabled={!currentPath} title="Up one folder (Backspace)">
                 <ArrowUp size={14} />
               </button>
               <button className="btn-icon" onClick={() => loadDirectory(currentPath)} title="Refresh">
                 <RefreshCw size={13} />
               </button>
+
+              <div style={{ height: "16px", width: "1px", backgroundColor: "var(--border-light)", margin: "0 4px" }} />
+
+              {/* CRUD Action Buttons */}
+              <button className="btn-secondary" style={{ padding: "3px 8px", fontSize: "12px" }} onClick={() => setModalNewFolder(true)}>
+                <FolderPlus size={13} /> New Folder
+              </button>
+              <button className="btn-secondary" style={{ padding: "3px 8px", fontSize: "12px" }} onClick={() => fileInputRef.current?.click()}>
+                <Upload size={13} /> Upload
+              </button>
+
+              {internalClipboard && (
+                <button className="btn-secondary" style={{ padding: "3px 8px", fontSize: "12px" }} onClick={handlePaste} title={`Paste ${internalClipboard.items.length} item(s)`}>
+                  <Clipboard size={13} /> Paste ({internalClipboard.items.length})
+                </button>
+              )}
             </div>
 
             {/* Breadcrumb Navigation */}
@@ -633,17 +1065,7 @@ export default function App() {
               <span className="crumb-segment" onClick={() => navigateTo("")}>
                 Workspace
               </span>
-              {breadcrumbs.map((seg, idx) => {
-                const subPath = breadcrumbs.slice(0, idx + 1).join("/");
-                return (
-                  <React.Fragment key={subPath}>
-                    <span className="crumb-sep">/</span>
-                    <span className="crumb-segment" onClick={() => navigateTo(subPath)}>
-                      {seg}
-                    </span>
-                  </React.Fragment>
-                );
-              })}
+              {renderBreadcrumbs()}
             </div>
 
             {/* Search Box */}
@@ -651,329 +1073,573 @@ export default function App() {
               <Search size={13} color="var(--text-muted)" />
               <input
                 type="text"
-                placeholder="Search files & folders..."
+                placeholder="Search folder..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
               />
             </div>
           </div>
 
-          {/* 4-Panel Grid */}
+          {/* Resizable 4-Panel Body with Interactive Splitters */}
           <div
-            className="panels-main"
-            style={{
-              gridTemplateColumns: maximizedPanel === "preview" ? "0px 1fr" : maximizedPanel === "activity" ? "1fr 0px" : "360px 1fr",
-              gridTemplateRows: maximizedPanel ? "1fr" : "1fr 200px"
-            }}
+            className="workspace-body"
+            onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+            onDragLeave={() => setIsDragOver(false)}
+            onDrop={handleContainerDrop}
           >
-            {/* Top-Left: Files & Folders */}
-            <div className="panel-container">
-              <div className="panel-header">
-                <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <FolderOpen size={13} /> Files & Folders
-                </span>
-                <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                  {filteredFiles.length} item{filteredFiles.length === 1 ? "" : "s"}
-                </span>
-              </div>
-              <div className="panel-content">
-                <table className="file-table">
-                  <thead>
-                    <tr>
-                      <th onClick={() => { setSortBy("name"); setSortAsc(!sortAsc); }}>Name</th>
-                      <th onClick={() => { setSortBy("type"); setSortAsc(!sortAsc); }}>Type</th>
-                      <th onClick={() => { setSortBy("size"); setSortAsc(!sortAsc); }}>Size</th>
-                      <th onClick={() => { setSortBy("modified"); setSortAsc(!sortAsc); }}>Modified</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredFiles.map((item) => (
-                      <tr
-                        key={item.path}
-                        className={`file-row ${selectedFile?.path === item.path ? "selected" : ""}`}
-                        onClick={() => handleSelectFile(item)}
-                        onDoubleClick={() => {
-                          if (item.is_dir) navigateTo(item.path);
-                        }}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          handleSelectFile(item);
-                          setContextMenu({ x: e.clientX, y: e.clientY, item });
-                        }}
-                      >
-                        <td className="file-name-cell">
-                          {item.is_dir ? (
-                            <Folder size={15} color="var(--text-secondary)" />
-                          ) : (
-                            <File size={15} color="var(--text-muted)" />
-                          )}
-                          <span>{item.name}</span>
-                        </td>
-                        <td>{item.type}</td>
-                        <td>{item.is_dir ? "—" : formatBytes(item.size)}</td>
-                        <td>{formatDate(item.modified)}</td>
-                      </tr>
-                    ))}
-                    {filteredFiles.length === 0 && (
-                      <tr>
-                        <td colSpan="4" style={{ textAlign: "center", padding: "20px", color: "var(--text-muted)" }}>
-                          No files found
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* Top-Right: File Inspector / Preview */}
-            <div className="panel-container">
-              <div className="panel-header">
-                <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <Info size={13} /> File Inspector & Preview
-                </span>
-                <div style={{ display: "flex", gap: "4px" }}>
-                  {selectedFile && !selectedFile.is_dir && (
-                    <button className="btn-secondary" style={{ padding: "2px 6px", fontSize: "11px" }} onClick={() => handleOpenLocally(selectedFile)}>
-                      <HardDrive size={11} /> Open Locally
-                    </button>
-                  )}
-                  <button
-                    className="btn-icon"
-                    title={maximizedPanel === "preview" ? "Restore" : "Maximize"}
-                    onClick={() => setMaximizedPanel(maximizedPanel === "preview" ? null : "preview")}
-                  >
-                    {maximizedPanel === "preview" ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-                  </button>
+            {isDragOver && (
+              <div className="drop-zone-overlay">
+                <div style={{ padding: "16px 24px", background: "var(--bg-surface)", border: "1px solid var(--border-medium)", borderRadius: "var(--radius-md)", fontWeight: 600 }}>
+                  Drop files to upload to /{currentPath}
                 </div>
               </div>
-              <div className="panel-content">
-                {selectedFile ? (
-                  <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-                    {/* File Meta Header */}
-                    <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border-light)", backgroundColor: "var(--bg-subtle)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            )}
+
+            {/* Left Column (Files + People) */}
+            <div
+              className="workspace-col-left"
+              style={{
+                width: maximizedPanel === "preview" ? "0px" : maximizedPanel === "activity" ? "100%" : `${layout.leftWidth}px`,
+                display: maximizedPanel === "preview" ? "none" : "flex"
+              }}
+            >
+              {/* Files & Folders Panel */}
+              <div className="panel-container" style={{ flex: 1 }}>
+                <div className="panel-header">
+                  <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <FolderOpen size={13} /> Files & Folders
+                  </span>
+                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    {selectedPaths.length > 0 ? `${selectedPaths.length} selected of ` : ""}{filteredFiles.length} item{filteredFiles.length === 1 ? "" : "s"}
+                  </span>
+                </div>
+                <div className="panel-content">
+                  <table className="file-table">
+                    <thead>
+                      <tr>
+                        <th onClick={() => { setSortBy("name"); setSortAsc(!sortAsc); }}>Name</th>
+                        <th onClick={() => { setSortBy("type"); setSortAsc(!sortAsc); }}>Type</th>
+                        <th onClick={() => { setSortBy("size"); setSortAsc(!sortAsc); }}>Size</th>
+                        <th onClick={() => { setSortBy("modified"); setSortAsc(!sortAsc); }}>Modified</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredFiles.map((item) => {
+                        const isSelected = selectedPaths.includes(item.path);
+                        const isRenaming = renamingPath === item.path;
+
+                        return (
+                          <tr
+                            key={item.path}
+                            draggable
+                            onDragStart={(e) => handleDragStart(e, item)}
+                            onDragOver={(e) => {
+                              if (item.is_dir) {
+                                e.preventDefault();
+                                setDragOverFolder(item.path);
+                              }
+                            }}
+                            onDragLeave={() => {
+                              if (dragOverFolder === item.path) setDragOverFolder(null);
+                            }}
+                            onDrop={(e) => {
+                              if (item.is_dir) handleDropOnFolder(e, item);
+                            }}
+                            className={`file-row ${isSelected ? "selected" : ""} ${dragOverFolder === item.path ? "drag-over" : ""}`}
+                            onClick={(e) => handleSelectFile(item, e)}
+                            onDoubleClick={() => {
+                              if (item.is_dir) navigateTo(item.path);
+                            }}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              if (!selectedPaths.includes(item.path)) {
+                                handleSelectFile(item, e);
+                              }
+                              setContextMenu({
+                                x: e.clientX,
+                                y: e.clientY,
+                                item,
+                                multi: selectedPaths.length > 1
+                              });
+                            }}
+                          >
+                            <td className="file-name-cell">
+                              {item.is_dir ? (
+                                <Folder size={15} color="var(--text-secondary)" />
+                              ) : (
+                                <File size={15} color="var(--text-muted)" />
+                              )}
+                              {isRenaming ? (
+                                <input
+                                  autoFocus
+                                  className="inline-rename-input"
+                                  value={renameValue}
+                                  onChange={(e) => setRenameValue(e.target.value)}
+                                  onBlur={() => handleCommitRename(item.path, renameValue)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") handleCommitRename(item.path, renameValue);
+                                    if (e.key === "Escape") setRenamingPath(null);
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                              ) : (
+                                <span>{item.name}</span>
+                              )}
+                            </td>
+                            <td>{item.type}</td>
+                            <td>{item.is_dir ? "—" : formatBytes(item.size)}</td>
+                            <td>{formatDate(item.modified)}</td>
+                          </tr>
+                        );
+                      })}
+                      {filteredFiles.length === 0 && (
+                        <tr>
+                          <td colSpan="4" style={{ textAlign: "center", padding: "30px 10px", color: "var(--text-muted)" }}>
+                            <div>This folder is empty.</div>
+                            <div style={{ fontSize: "11px", marginTop: "4px" }}>Drop files here or click New Folder / Upload</div>
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Horizontal Splitter (Between Files & People) */}
+              <div
+                className="splitter-horizontal"
+                onMouseDown={handleMouseDownSplitter("leftVertical")}
+                title="Drag to resize People panel"
+              />
+
+              {/* People & Access Panel */}
+              <div className="panel-container" style={{ height: `${layout.peopleHeight}px`, flexShrink: 0 }}>
+                <div className="panel-header">
+                  <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <Users size={13} /> People & Access ({connectedUsers.length})
+                  </span>
+                </div>
+                <div className="panel-content" style={{ padding: "6px 8px" }}>
+                  {connectedUsers.map((u) => (
+                    <div
+                      key={u.client_id}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        padding: "6px 8px",
+                        borderBottom: "1px solid var(--border-light)"
+                      }}
+                    >
                       <div>
-                        <div style={{ fontWeight: 600, fontSize: "14px" }}>{selectedFile.name}</div>
-                        <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginTop: "2px" }}>
-                          {selectedFile.type} • {selectedFile.is_dir ? "Folder" : formatBytes(selectedFile.size)} • Modified {formatDate(selectedFile.modified)}
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: 500 }}>
+                          <span className="status-dot connected" />
+                          <span>{u.user_name}</span>
+                          {u.is_host && <span className="brand-badge">HOST</span>}
+                        </div>
+                        <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+                          {u.viewing_file ? `Viewing: ${u.viewing_file}` : "Browsing files"}
                         </div>
                       </div>
-
-                      {/* Current Viewers pill */}
-                      {fileMetadata?.current_viewers && fileMetadata.current_viewers.length > 0 && (
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px", backgroundColor: "var(--bg-surface)", padding: "3px 8px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", fontSize: "11px" }}>
-                          <Users size={12} color="var(--status-green)" />
-                          <span>Viewing:</span>
-                          <strong>{fileMetadata.current_viewers.map((v) => v.user_name).join(", ")}</strong>
-                        </div>
-                      )}
+                      <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Read</span>
                     </div>
+                  ))}
+                </div>
+              </div>
+            </div>
 
-                    {/* Preview Content */}
-                    <div style={{ flex: 1, overflow: "auto" }}>
-                      {filePreview?.kind === "text" && (
-                        <pre className="preview-code-block">{filePreview.content}</pre>
-                      )}
-                      {filePreview?.kind === "image" && (
-                        <div style={{ padding: "20px", display: "flex", justifyContent: "center", alignItems: "center", height: "100%" }}>
-                          <img
-                            src={`${serverUrl}/api/file/raw?path=${encodeURIComponent(selectedFile.path)}&token=${token}`}
-                            alt={selectedFile.name}
-                            style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", border: "1px solid var(--border-light)" }}
-                          />
-                        </div>
-                      )}
-                      {filePreview?.kind === "binary" && (
-                        <div className="inspector-empty">
-                          <AlertCircle size={28} />
-                          <div>Preview unavailable for binary file ({selectedFile.name})</div>
-                          <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                            <button className="btn-secondary" onClick={() => handleOpenLocally(selectedFile)}>
-                              Open Locally
-                            </button>
-                            <a
-                              href={`${serverUrl}/api/file/download?path=${encodeURIComponent(selectedFile.path)}`}
-                              className="btn-secondary"
-                              style={{ textDecoration: "none" }}
-                            >
-                              Download
-                            </a>
+            {/* Vertical Splitter (Between Left Column and Right Column) */}
+            {maximizedPanel !== "preview" && (
+              <div
+                className="splitter-vertical"
+                onMouseDown={handleMouseDownSplitter("left")}
+                title="Drag to resize panels"
+              />
+            )}
+
+            {/* Right Column (Preview + Activity) */}
+            <div
+              className="workspace-col-right"
+              style={{
+                display: maximizedPanel === "activity" ? "none" : "flex"
+              }}
+            >
+              {/* File Inspector / Preview */}
+              <div className="panel-container" style={{ flex: 1 }}>
+                <div className="panel-header">
+                  <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <Info size={13} /> File Inspector & Preview
+                  </span>
+                  <div style={{ display: "flex", gap: "4px" }}>
+                    {activeFile && !activeFile.is_dir && (
+                      <button className="btn-secondary" style={{ padding: "2px 6px", fontSize: "11px" }} onClick={() => handleOpenLocally(activeFile)}>
+                        <HardDrive size={11} /> Open Locally
+                      </button>
+                    )}
+                    <button
+                      className="btn-icon"
+                      title={maximizedPanel === "preview" ? "Restore" : "Maximize"}
+                      onClick={() => setMaximizedPanel(maximizedPanel === "preview" ? null : "preview")}
+                    >
+                      {maximizedPanel === "preview" ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                    </button>
+                  </div>
+                </div>
+                <div className="panel-content">
+                  {activeFile ? (
+                    <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+                      <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border-light)", backgroundColor: "var(--bg-subtle)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: "14px" }}>{activeFile.name}</div>
+                          <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginTop: "2px" }}>
+                            {activeFile.type} • {activeFile.is_dir ? "Folder" : formatBytes(activeFile.size)} • Modified {formatDate(activeFile.modified)}
                           </div>
                         </div>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="inspector-empty">
-                    <FileText size={24} />
-                    <span>Select a file to inspect metadata and view preview</span>
-                  </div>
-                )}
-              </div>
-            </div>
 
-            {/* Bottom-Left: People & Access */}
-            <div className="panel-container">
-              <div className="panel-header">
-                <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <Users size={13} /> People & Access ({connectedUsers.length})
-                </span>
-              </div>
-              <div className="panel-content" style={{ padding: "6px 8px" }}>
-                {connectedUsers.map((u) => (
-                  <div
-                    key={u.client_id}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      padding: "6px 8px",
-                      borderBottom: "1px solid var(--border-light)"
-                    }}
-                  >
-                    <div>
-                      <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: 500 }}>
-                        <span className="status-dot connected" />
-                        <span>{u.user_name}</span>
-                        {u.is_host && <span className="brand-badge">HOST</span>}
+                        {fileMetadata?.current_viewers && fileMetadata.current_viewers.length > 0 && (
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px", backgroundColor: "var(--bg-surface)", padding: "3px 8px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", fontSize: "11px" }}>
+                            <Users size={12} color="var(--status-green)" />
+                            <span>Viewing:</span>
+                            <strong>{fileMetadata.current_viewers.map((v) => v.user_name).join(", ")}</strong>
+                          </div>
+                        )}
                       </div>
-                      <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
-                        {u.viewing_file ? `Viewing: ${u.viewing_file}` : "Browsing files"}
+
+                      <div style={{ flex: 1, overflow: "auto" }}>
+                        {filePreview?.kind === "text" && (
+                          <pre className="preview-code-block">{filePreview.content}</pre>
+                        )}
+                        {filePreview?.kind === "image" && (
+                          <div style={{ padding: "20px", display: "flex", justifyContent: "center", alignItems: "center", height: "100%" }}>
+                            <img
+                              src={`${serverUrl}/api/file/raw?path=${encodeURIComponent(activeFile.path)}&token=${token}`}
+                              alt={activeFile.name}
+                              style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", border: "1px solid var(--border-light)" }}
+                            />
+                          </div>
+                        )}
+                        {filePreview?.kind === "binary" && (
+                          <div className="inspector-empty">
+                            <AlertCircle size={28} />
+                            <div>Preview unavailable for binary file ({activeFile.name})</div>
+                            <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                              <button className="btn-secondary" onClick={() => handleOpenLocally(activeFile)}>
+                                Open Locally
+                              </button>
+                              <a
+                                href={`${serverUrl}/api/file/download?path=${encodeURIComponent(activeFile.path)}`}
+                                className="btn-secondary"
+                                style={{ textDecoration: "none" }}
+                              >
+                                Download
+                              </a>
+                            </div>
+                          </div>
+                        )}
+                        {!filePreview && (
+                          <div className="inspector-empty">
+                            <Folder size={28} color="var(--text-muted)" />
+                            <span>Folder selected. Double-click to browse contents.</span>
+                          </div>
+                        )}
                       </div>
                     </div>
-                    <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Read</span>
-                  </div>
-                ))}
+                  ) : (
+                    <div className="inspector-empty">
+                      <File size={24} />
+                      <span>Select a file to inspect metadata and view preview</span>
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
 
-            {/* Bottom-Right: Activity Feed */}
-            <div className="panel-container">
-              <div className="panel-header">
-                <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <Activity size={13} /> Realtime Activity
-                </span>
-                <button
-                  className="btn-icon"
-                  title={maximizedPanel === "activity" ? "Restore" : "Maximize"}
-                  onClick={() => setMaximizedPanel(maximizedPanel === "activity" ? null : "activity")}
-                >
-                  {maximizedPanel === "activity" ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-                </button>
-              </div>
-              <div className="panel-content" style={{ padding: "4px 8px" }}>
-                {activityLogs.map((log) => (
-                  <div
-                    key={log.id}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "8px",
-                      padding: "4px 6px",
-                      fontSize: "12px",
-                      borderBottom: "1px solid var(--border-light)"
-                    }}
+              {/* Horizontal Splitter (Between Preview & Activity) */}
+              <div
+                className="splitter-horizontal"
+                onMouseDown={handleMouseDownSplitter("rightVertical")}
+                title="Drag to resize Activity panel"
+              />
+
+              {/* Realtime Activity Panel */}
+              <div className="panel-container" style={{ height: `${layout.activityHeight}px`, flexShrink: 0 }}>
+                <div className="panel-header">
+                  <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <Activity size={13} /> Realtime Activity
+                  </span>
+                  <button
+                    className="btn-icon"
+                    title={maximizedPanel === "activity" ? "Restore" : "Maximize"}
+                    onClick={() => setMaximizedPanel(maximizedPanel === "activity" ? null : "activity")}
                   >
-                    <span style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: "11px" }}>
-                      {formatTime(log.timestamp)}
-                    </span>
-                    <strong style={{ color: "var(--text-primary)" }}>{log.user_name}</strong>
-                    <span style={{ color: "var(--text-secondary)" }}>{formatEventDesc(log)}</span>
-                  </div>
-                ))}
+                    {maximizedPanel === "activity" ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                  </button>
+                </div>
+                <div className="panel-content" style={{ padding: "4px 8px" }}>
+                  {activityLogs.map((log) => (
+                    <div
+                      key={log.id}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        padding: "4px 6px",
+                        fontSize: "12px",
+                        borderBottom: "1px solid var(--border-light)"
+                      }}
+                    >
+                      <span style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: "11px" }}>
+                        {formatTime(log.timestamp)}
+                      </span>
+                      <strong style={{ color: "var(--text-primary)" }}>{log.user_name}</strong>
+                      <span style={{ color: "var(--text-secondary)" }}>{formatEventDesc(log)}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Compact Context Menu */}
+      {/* Context Menu (Adaptive for Single & Multi-Selection) */}
       {contextMenu && (
         <div
           className="context-menu"
           style={{ top: `${contextMenu.y}px`, left: `${contextMenu.x}px` }}
           onClick={(e) => e.stopPropagation()}
         >
-          <div
-            className="context-item"
-            onClick={() => {
-              if (contextMenu.item.is_dir) navigateTo(contextMenu.item.path);
-              else handleSelectFile(contextMenu.item);
-              setContextMenu(null);
-            }}
-          >
-            {contextMenu.item.is_dir ? <FolderOpen size={14} /> : <FileText size={14} />}
-            <span>{contextMenu.item.is_dir ? "Open Folder" : "Open Preview"}</span>
-          </div>
+          {!contextMenu.multi ? (
+            <>
+              <div
+                className="context-item"
+                onClick={() => {
+                  if (contextMenu.item.is_dir) navigateTo(contextMenu.item.path);
+                  else handleSelectFile(contextMenu.item);
+                  setContextMenu(null);
+                }}
+              >
+                {contextMenu.item.is_dir ? <FolderOpen size={14} /> : <File size={14} />}
+                <span>{contextMenu.item.is_dir ? "Open Folder" : "Open Preview"}</span>
+              </div>
 
-          {!contextMenu.item.is_dir && (
-            <div
-              className="context-item"
-              onClick={() => {
-                handleOpenLocally(contextMenu.item);
-                setContextMenu(null);
-              }}
-            >
-              <HardDrive size={14} />
-              <span>Open Locally</span>
+              {!contextMenu.item.is_dir && (
+                <div
+                  className="context-item"
+                  onClick={() => {
+                    handleOpenLocally(contextMenu.item);
+                    setContextMenu(null);
+                  }}
+                >
+                  <HardDrive size={14} />
+                  <span>Open Locally</span>
+                </div>
+              )}
+
+              {!contextMenu.item.is_dir && (
+                <a
+                  href={`${serverUrl}/api/file/download?path=${encodeURIComponent(contextMenu.item.path)}`}
+                  className="context-item"
+                  style={{ textDecoration: "none" }}
+                  onClick={() => setContextMenu(null)}
+                >
+                  <Download size={14} />
+                  <span>Download</span>
+                </a>
+              )}
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  setRenamingPath(contextMenu.item.path);
+                  setRenameValue(contextMenu.item.name);
+                  setContextMenu(null);
+                }}
+              >
+                <Edit2 size={14} />
+                <span>Rename (F2)</span>
+              </div>
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  handleCopySelected();
+                  setContextMenu(null);
+                }}
+              >
+                <Copy size={14} />
+                <span>Copy</span>
+              </div>
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  handleCutSelected();
+                  setContextMenu(null);
+                }}
+              >
+                <Scissors size={14} />
+                <span>Cut</span>
+              </div>
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  setModalDeleteConfirm([contextMenu.item]);
+                  setContextMenu(null);
+                }}
+              >
+                <Trash2 size={14} color="var(--status-red)" />
+                <span style={{ color: "var(--status-red)" }}>Delete</span>
+              </div>
+
+              <div className="context-divider" />
+
+              <div
+                className="context-item"
+                onClick={async () => {
+                  try {
+                    const res = await fetch(`${serverUrl}/api/file/access_history?path=${encodeURIComponent(contextMenu.item.path)}`, {
+                      headers: { Authorization: `Bearer ${token}` }
+                    });
+                    if (res.ok) {
+                      setModalAccessHistory({
+                        file: contextMenu.item,
+                        history: await res.json()
+                      });
+                    }
+                  } catch (e) {}
+                  setContextMenu(null);
+                }}
+              >
+                <Clock size={14} />
+                <span>Access History</span>
+              </div>
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  setModalProperties(contextMenu.item);
+                  setContextMenu(null);
+                }}
+              >
+                <Info size={14} />
+                <span>Properties</span>
+              </div>
+            </>
+          ) : (
+            /* Multi-Selection Context Actions */
+            <>
+              <div
+                className="context-item"
+                onClick={() => {
+                  const selectedItems = files.filter((f) => selectedPaths.includes(f.path));
+                  handleOpenLocally(selectedItems);
+                  setContextMenu(null);
+                }}
+              >
+                <HardDrive size={14} />
+                <span>Open {selectedPaths.length} Locally</span>
+              </div>
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  handleCopySelected();
+                  setContextMenu(null);
+                }}
+              >
+                <Copy size={14} />
+                <span>Copy {selectedPaths.length} items</span>
+              </div>
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  handleCutSelected();
+                  setContextMenu(null);
+                }}
+              >
+                <Scissors size={14} />
+                <span>Cut {selectedPaths.length} items</span>
+              </div>
+
+              <div
+                className="context-item"
+                onClick={() => {
+                  const items = files.filter((f) => selectedPaths.includes(f.path));
+                  setModalDeleteConfirm(items);
+                  setContextMenu(null);
+                }}
+              >
+                <Trash2 size={14} color="var(--status-red)" />
+                <span style={{ color: "var(--status-red)" }}>Delete {selectedPaths.length} items</span>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* New Folder Dialog */}
+      {modalNewFolder && (
+        <div className="modal-overlay" onClick={() => setModalNewFolder(false)}>
+          <div className="modal-window" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>New Folder</span>
             </div>
-          )}
-
-          {!contextMenu.item.is_dir && (
-            <a
-              href={`${serverUrl}/api/file/download?path=${encodeURIComponent(contextMenu.item.path)}`}
-              className="context-item"
-              style={{ textDecoration: "none" }}
-              onClick={() => setContextMenu(null)}
-            >
-              <Download size={14} />
-              <span>Download</span>
-            </a>
-          )}
-
-          <div
-            className="context-item"
-            onClick={() => {
-              navigator.clipboard.writeText(contextMenu.item.path);
-              setContextMenu(null);
-            }}
-          >
-            <Copy size={14} />
-            <span>Copy Path</span>
+            <form onSubmit={handleCreateFolder}>
+              <div className="modal-body">
+                <div className="form-group">
+                  <label className="form-label">Folder Name</label>
+                  <input
+                    autoFocus
+                    className="form-input"
+                    value={newFolderName}
+                    onChange={(e) => setNewFolderName(e.target.value)}
+                    placeholder="Enter folder name"
+                    required
+                  />
+                </div>
+              </div>
+              <div className="modal-footer">
+                <button type="button" className="btn-secondary" onClick={() => setModalNewFolder(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn-primary">
+                  Create Folder
+                </button>
+              </div>
+            </form>
           </div>
+        </div>
+      )}
 
-          <div className="context-divider" />
-
-          <div
-            className="context-item"
-            onClick={async () => {
-              try {
-                const res = await fetch(`${serverUrl}/api/file/access_history?path=${encodeURIComponent(contextMenu.item.path)}`, {
-                  headers: { Authorization: `Bearer ${token}` }
-                });
-                if (res.ok) {
-                  setModalAccessHistory({
-                    file: contextMenu.item,
-                    history: await res.json()
-                  });
-                }
-              } catch (e) {}
-              setContextMenu(null);
-            }}
-          >
-            <Clock size={14} />
-            <span>Access History</span>
-          </div>
-
-          <div
-            className="context-item"
-            onClick={() => {
-              setModalProperties(contextMenu.item);
-              setContextMenu(null);
-            }}
-          >
-            <Info size={14} />
-            <span>Properties</span>
+      {/* Delete Confirmation Dialog */}
+      {modalDeleteConfirm && (
+        <div className="modal-overlay" onClick={() => setModalDeleteConfirm(null)}>
+          <div className="modal-window" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>Confirm Deletion</span>
+            </div>
+            <div className="modal-body">
+              <p style={{ marginBottom: "8px" }}>
+                Are you sure you want to permanently delete {modalDeleteConfirm.length === 1 ? `"${modalDeleteConfirm[0].name}"` : `${modalDeleteConfirm.length} items`}?
+              </p>
+              <p style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                This action removes the items from the host computer and cannot be undone.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalDeleteConfirm(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                style={{ backgroundColor: "var(--status-red)", borderColor: "var(--status-red)" }}
+                onClick={handleDeleteConfirmed}
+              >
+                Delete Permanently
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1093,7 +1759,17 @@ function formatEventDesc(log) {
     case "FILE_DOWNLOADED":
       return `downloaded ${log.file_path}`;
     case "FILE_COPIED":
-      return `opened locally ${log.file_path}`;
+      return `copied ${log.file_path}`;
+    case "FILE_CREATED":
+      return `created ${log.file_path}`;
+    case "FILE_RENAMED":
+      return `renamed ${log.file_path}`;
+    case "FILE_MOVED":
+      return `moved ${log.file_path}`;
+    case "FILE_DELETED":
+      return `deleted ${log.file_path}`;
+    case "FILE_UPLOADED":
+      return `uploaded ${log.file_path}`;
     default:
       return log.details || log.event_type;
   }

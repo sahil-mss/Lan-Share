@@ -5,3 +5,5 @@ node_modules/
 dist/
 .lanshare_activity.db*
 .DS_Store
+temp_test_workspace/
+temp_crud_test_ws/

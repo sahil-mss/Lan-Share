@@ -9,6 +9,9 @@ import time
 from pathlib import Path
 import os
 
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 BASE_URL = "http://127.0.0.1:7420"
 TEST_ROOT = str(Path(__file__).parent.parent / "temp_test_workspace")
 
@@ -47,6 +50,8 @@ def api_get(endpoint, token=None):
 def run_audit():
     print("=== STARTING LANSHARE PHASE 1 WORKSPACE AUDIT ===")
 
+    # Ensure test workspace files exist
+    import tests.create_test_ws
     # 1. Server Status
     status_code, status = api_get("/api/status")
     assert status_code == 200

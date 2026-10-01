@@ -14,7 +14,7 @@ import os
 import time
 from typing import Dict, List, Optional, Any
 
-from server.filesystem import FileSystemManager, PathSecurityError
+from server.filesystem import FileSystemManager, PathSecurityError, FileConflictError
 from server.logger import ActivityLogger
 from server.discovery import LANDiscovery
 
@@ -93,6 +93,26 @@ class TrackCopyRequest(BaseModel):
     shared_path: str
     local_path: str
     version_hash: Optional[str] = None
+
+class CreateFolderRequest(BaseModel):
+    parent_path: str = ""
+    folder_name: str
+
+class RenameRequest(BaseModel):
+    path: str
+    new_name: str
+
+class MoveRequest(BaseModel):
+    source_path: str
+    dest_parent: str = ""
+    overwrite: bool = False
+
+class CopyRequest(BaseModel):
+    source_path: str
+    dest_parent: str = ""
+
+class DeleteRequest(BaseModel):
+    paths: List[str]
 
 # Broadcast real-time updates
 async def broadcast_event(event_type: str, payload: Any):
@@ -366,6 +386,158 @@ def get_activity_feed(session: Dict[str, Any] = Depends(get_current_session)):
     if not SERVER_STATE["logger"]:
         return []
     return SERVER_STATE["logger"].get_recent_activity(60)
+
+@app.post("/api/folder/create")
+async def create_folder(req: CreateFolderRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    fs: FileSystemManager = SERVER_STATE["fs"]
+    if not fs:
+        raise HTTPException(status_code=503, detail="Workspace filesystem not initialized.")
+    try:
+        res = fs.create_folder(req.parent_path, req.folder_name)
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event(
+                "FILE_CREATED",
+                session["user_name"],
+                session["client_id"],
+                file_path=res["path"],
+                details=f"Created folder '{req.folder_name}'"
+            )
+        await broadcast_event("WORKSPACE_CHANGED", {"action": "CREATE_FOLDER", "path": res["path"], "parent": req.parent_path})
+        return {"success": True, "item": res}
+    except FileConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/file/rename")
+async def rename_item(req: RenameRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    fs: FileSystemManager = SERVER_STATE["fs"]
+    if not fs:
+        raise HTTPException(status_code=503, detail="Workspace filesystem not initialized.")
+    try:
+        res = fs.rename_item(req.path, req.new_name)
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event(
+                "FILE_RENAMED",
+                session["user_name"],
+                session["client_id"],
+                file_path=res["new_path"],
+                details=f"Renamed from '{res['old_path']}' to '{res['new_path']}'"
+            )
+        await broadcast_event("WORKSPACE_CHANGED", {"action": "RENAME", "old_path": res["old_path"], "new_path": res["new_path"]})
+        return {"success": True, "item": res}
+    except FileConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/file/move")
+async def move_item(req: MoveRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    fs: FileSystemManager = SERVER_STATE["fs"]
+    if not fs:
+        raise HTTPException(status_code=503, detail="Workspace filesystem not initialized.")
+    try:
+        res = fs.move_item(req.source_path, req.dest_parent, overwrite=req.overwrite)
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event(
+                "FILE_MOVED",
+                session["user_name"],
+                session["client_id"],
+                file_path=res["destination"],
+                details=f"Moved from '{res['source']}' to '{res['destination']}'"
+            )
+        await broadcast_event("WORKSPACE_CHANGED", {"action": "MOVE", "source": res["source"], "destination": res["destination"]})
+        return {"success": True, "item": res}
+    except FileConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/file/copy")
+async def copy_item(req: CopyRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    fs: FileSystemManager = SERVER_STATE["fs"]
+    if not fs:
+        raise HTTPException(status_code=503, detail="Workspace filesystem not initialized.")
+    try:
+        res = fs.copy_item(req.source_path, req.dest_parent)
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event(
+                "FILE_COPIED",
+                session["user_name"],
+                session["client_id"],
+                file_path=res["new_path"],
+                details=f"Copied from '{res['source']}' to '{res['new_path']}'"
+            )
+        await broadcast_event("WORKSPACE_CHANGED", {"action": "COPY", "source": res["source"], "new_path": res["new_path"]})
+        return {"success": True, "item": res}
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/files/delete")
+async def delete_items(req: DeleteRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    fs: FileSystemManager = SERVER_STATE["fs"]
+    if not fs:
+        raise HTTPException(status_code=503, detail="Workspace filesystem not initialized.")
+    results = []
+    for path in req.paths:
+        try:
+            res = fs.delete_item(path)
+            if SERVER_STATE["logger"]:
+                SERVER_STATE["logger"].log_event(
+                    "FILE_DELETED",
+                    session["user_name"],
+                    session["client_id"],
+                    file_path=path,
+                    details=f"Deleted {'folder' if res['is_dir'] else 'file'} '{res['name']}'"
+                )
+            results.append(res)
+        except Exception as e:
+            results.append({"path": path, "error": str(e)})
+
+    await broadcast_event("WORKSPACE_CHANGED", {"action": "DELETE", "paths": req.paths})
+    return {"success": True, "results": results}
+
+@app.post("/api/file/upload")
+async def upload_file(
+    parent_path: str = Query(""),
+    file: UploadFile = File(...),
+    session: Dict[str, Any] = Depends(get_current_session)
+):
+    fs: FileSystemManager = SERVER_STATE["fs"]
+    if not fs:
+        raise HTTPException(status_code=503, detail="Workspace filesystem not initialized.")
+
+    def chunk_generator():
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            yield chunk
+
+    try:
+        res = fs.save_uploaded_file(parent_path, file.filename, chunk_generator())
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event(
+                "FILE_UPLOADED",
+                session["user_name"],
+                session["client_id"],
+                file_path=res["path"],
+                details=f"Uploaded '{res['name']}' ({res['size']} bytes)"
+            )
+        await broadcast_event("WORKSPACE_CHANGED", {"action": "UPLOAD", "path": res["path"], "parent": parent_path})
+        return {"success": True, "item": res}
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/users")
 def get_users(session: Dict[str, Any] = Depends(get_current_session)):
