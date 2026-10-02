@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any
 from server.filesystem import FileSystemManager, PathSecurityError, FileConflictError
 from server.logger import ActivityLogger
 from server.discovery import LANDiscovery
+from server.locking import FileLockManager
 
 from fastapi.staticfiles import StaticFiles
 
@@ -45,6 +46,7 @@ SERVER_STATE: Dict[str, Any] = {
     "host_ip": "127.0.0.1",
     "fs": None,  # FileSystemManager
     "logger": None,  # ActivityLogger
+    "lock_manager": None,  # FileLockManager
     "discovery": None,  # LANDiscovery
 }
 
@@ -113,6 +115,42 @@ class CopyRequest(BaseModel):
 
 class DeleteRequest(BaseModel):
     paths: List[str]
+
+# Phase 3: Lock, Queue, and Commit Request Models
+class WriteAccessRequest(BaseModel):
+    file_path: str
+
+class CancelWriteRequest(BaseModel):
+    file_path: str
+
+class HostGrantRequest(BaseModel):
+    file_path: str
+    target_client_id: Optional[str] = None
+
+class HostDenyRequest(BaseModel):
+    file_path: str
+    target_client_id: str
+    reason: Optional[str] = None
+
+class HostReorderRequest(BaseModel):
+    file_path: str
+    target_client_id: str
+    direction: str  # "up" or "down"
+
+class HostRevokeRequest(BaseModel):
+    file_path: str
+    reason: Optional[str] = None
+
+class ReleaseLockRequest(BaseModel):
+    file_path: str
+    lock_id: Optional[str] = None
+
+class CommitRequest(BaseModel):
+    file_path: str
+    lock_id: str
+    content: str
+    summary: Optional[str] = None
+    release_lock: bool = True
 
 # Broadcast real-time updates
 async def broadcast_event(event_type: str, payload: Any):
@@ -184,6 +222,7 @@ async def start_host_server(req: HostStartRequest):
     # Activity logger db placed inside root or user config
     log_db = p / ".lanshare_activity.db"
     SERVER_STATE["logger"] = ActivityLogger(log_db)
+    SERVER_STATE["lock_manager"] = FileLockManager(log_db, SERVER_STATE["fs"])
 
     # Start LAN discovery
     if SERVER_STATE["discovery"]:
@@ -284,6 +323,13 @@ async def leave_workspace(session: Dict[str, Any] = Depends(get_current_session)
         if s["client_id"] == session["client_id"]:
             SESSIONS.pop(token, None)
             break
+
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if lm:
+        affected = lm.handle_client_disconnect(session["client_id"])
+        for file_path, updated_state in affected:
+            await broadcast_event("LOCK_STATE_CHANGED", {"file_path": file_path, "state": updated_state, "action": "CLIENT_DISCONNECTED"})
+
     if SERVER_STATE["logger"]:
         SERVER_STATE["logger"].log_event("USER_LEFT", session["user_name"], session["client_id"])
     await broadcast_event("USER_LEFT", {"client_id": session["client_id"], "user_name": session["user_name"]})
@@ -318,6 +364,25 @@ def get_metadata(path: str, session: Dict[str, Any] = Depends(get_current_sessio
             for s in SESSIONS.values() if s.get("viewing_file") == path
         ]
         meta["current_viewers"] = current_viewers
+
+        # Enrich with File Locking & Version State
+        lm: FileLockManager = SERVER_STATE["lock_manager"]
+        if lm and not meta.get("is_dir"):
+            file_state = lm.get_file_state(path)
+            meta["lock_state"] = file_state["state"]
+            meta["version"] = file_state["version"]
+            meta["writer"] = file_state["writer"]
+            meta["queue"] = file_state["queue"]
+            meta["queue_count"] = file_state["queue_count"]
+            meta["last_author"] = file_state["last_author"]
+        else:
+            meta["lock_state"] = "AVAILABLE"
+            meta["version"] = 1
+            meta["writer"] = None
+            meta["queue"] = []
+            meta["queue_count"] = 0
+            meta["last_author"] = None
+
         return meta
     except PathSecurityError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -547,6 +612,282 @@ async def upload_file(
             )
         await broadcast_event("WORKSPACE_CHANGED", {"action": "UPLOAD", "path": res["path"], "parent": parent_path})
         return {"success": True, "item": res}
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Phase 3 File Locking, Request Queue & Commit Endpoints ---
+
+@app.get("/api/lock/state")
+def get_lock_state(path: str, session: Dict[str, Any] = Depends(get_current_session)):
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(path)
+        return lm.get_file_state(path)
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/lock/request")
+async def request_file_lock(req: WriteAccessRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        # Non-host requests are queued or granted via FIFO auto-grant
+        success, action, state = lm.request_write_access(
+            req.file_path, session["client_id"], session["user_name"], is_host=session.get("is_host", False)
+        )
+        if not success:
+            raise HTTPException(status_code=400, detail=action)
+
+        if SERVER_STATE["logger"]:
+            if action == "GRANTED":
+                SERVER_STATE["logger"].log_event("LOCK_CREATED", session["user_name"], session["client_id"], file_path=req.file_path, details="Granted edit access")
+            else:
+                SERVER_STATE["logger"].log_event("WRITE_REQUESTED", session["user_name"], session["client_id"], file_path=req.file_path, details=f"Joined edit queue (pos {len(state.get('queue', []))})")
+
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": state["file_path"], "state": state, "action": action})
+        return {"success": True, "action": action, "state": state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/lock/cancel")
+async def cancel_file_lock_request(req: CancelWriteRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        success, msg, state = lm.cancel_write_request(req.file_path, session["client_id"])
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event("WRITE_CANCELLED", session["user_name"], session["client_id"], file_path=req.file_path, details="Cancelled queue request")
+
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": state["file_path"], "state": state, "action": "CANCELLED"})
+        return {"success": True, "state": state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/lock/host/grant")
+async def host_grant_lock(req: HostGrantRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    if not session.get("is_host"):
+        raise HTTPException(status_code=403, detail="Host permission required to grant edit access.")
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        success, msg, state = lm.host_grant(req.file_path, req.target_client_id)
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+
+        writer = state.get("writer")
+        writer_name = writer["user_name"] if writer else "user"
+        writer_id = writer["client_id"] if writer else ""
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event("WRITE_GRANTED", session["user_name"], session["client_id"], file_path=req.file_path, details=f"Host granted edit access to {writer_name}")
+            SERVER_STATE["logger"].log_event("LOCK_CREATED", writer_name, writer_id, file_path=req.file_path, details=f"Lock created by host grant")
+
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": state["file_path"], "state": state, "action": "GRANTED"})
+        return {"success": True, "state": state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/lock/host/deny")
+async def host_deny_lock(req: HostDenyRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    if not session.get("is_host"):
+        raise HTTPException(status_code=403, detail="Host permission required to deny write requests.")
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        success, msg, state, denied_user = lm.host_deny(req.file_path, req.target_client_id)
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event("WRITE_DENIED", session["user_name"], session["client_id"], file_path=req.file_path, details=f"Host denied write access for {denied_user or req.target_client_id}: {req.reason or 'No reason provided'}")
+
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": state["file_path"], "state": state, "action": "DENIED", "target_client_id": req.target_client_id, "reason": req.reason})
+        return {"success": True, "state": state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/lock/host/reorder")
+async def host_reorder_lock_queue(req: HostReorderRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    if not session.get("is_host"):
+        raise HTTPException(status_code=403, detail="Host permission required to reorder edit queue.")
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        success, msg, state = lm.host_reorder_queue(req.file_path, req.target_client_id, req.direction)
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": state["file_path"], "state": state, "action": "REORDERED"})
+        return {"success": True, "state": state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/lock/host/revoke")
+async def host_revoke_lock(req: HostRevokeRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    if not session.get("is_host"):
+        raise HTTPException(status_code=403, detail="Host permission required to revoke locks.")
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        success, msg, state, revoked_lock = lm.host_revoke(req.file_path)
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+
+        revoked_writer = revoked_lock["writer_user_name"] if revoked_lock else "user"
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event("LOCK_REVOKED", session["user_name"], session["client_id"], file_path=req.file_path, details=f"Host revoked edit access from {revoked_writer}")
+
+        state = lm.get_file_state(req.file_path)
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": state["file_path"], "state": state, "action": "REVOKED", "revoked_writer": revoked_writer})
+        return {"success": True, "state": state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/lock/release")
+async def release_file_lock(req: ReleaseLockRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        success, msg, state, released_lock = lm.release_lock(req.file_path, session["client_id"], req.lock_id)
+        if not success:
+            raise HTTPException(status_code=400, detail=msg)
+
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event("LOCK_RELEASED", session["user_name"], session["client_id"], file_path=req.file_path, details="Released edit access")
+
+        # Auto-promote next writer from queue if waiting
+        promoted = lm.auto_promote_next_writer(req.file_path)
+        state = lm.get_file_state(req.file_path)
+        if promoted and SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event("LOCK_CREATED", promoted["writer_user_name"], promoted["writer_client_id"], file_path=req.file_path, details="Auto-granted edit access to next queued writer")
+
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": state["file_path"], "state": state, "action": "RELEASED"})
+        return {"success": True, "state": state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/file/commit")
+async def commit_file_changes(req: CommitRequest, session: Dict[str, Any] = Depends(get_current_session)):
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(req.file_path)
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event("COMMIT_STARTED", session["user_name"], session["client_id"], file_path=req.file_path, details="Starting commit verification")
+
+        content_bytes = req.content.encode("utf-8")
+        success, msg, commit_info = lm.validate_and_commit(
+            file_path=req.file_path,
+            client_id=session["client_id"],
+            lock_id=req.lock_id,
+            content_bytes=content_bytes,
+            author=session["user_name"],
+            summary=req.summary,
+            release_lock_after=req.release_lock
+        )
+
+        if not success:
+            if SERVER_STATE["logger"]:
+                SERVER_STATE["logger"].log_event("COMMIT_REJECTED", session["user_name"], session["client_id"], file_path=req.file_path, details=msg)
+            raise HTTPException(status_code=409, detail=msg)
+
+        if SERVER_STATE["logger"]:
+            SERVER_STATE["logger"].log_event(
+                "COMMIT_CREATED",
+                session["user_name"],
+                session["client_id"],
+                file_path=req.file_path,
+                details=f"Committed Version {commit_info['version_number']} (Hash: {commit_info['content_hash'][:8]})"
+            )
+
+        # Check if next writer should be promoted if lock was released
+        if req.release_lock:
+            promoted = lm.auto_promote_next_writer(req.file_path)
+            if promoted and SERVER_STATE["logger"]:
+                SERVER_STATE["logger"].log_event("LOCK_CREATED", promoted["writer_user_name"], promoted["writer_client_id"], file_path=req.file_path, details="Auto-granted edit access from queue")
+
+        current_file_state = lm.get_file_state(req.file_path)
+
+        # Broadcast commit and lock change events to all clients
+        await broadcast_event("FILE_COMMITTED", {
+            "file_path": req.file_path,
+            "version": commit_info["version_number"],
+            "previous_version": commit_info["previous_version"],
+            "author": commit_info["author"],
+            "content_hash": commit_info["content_hash"],
+            "timestamp": commit_info["timestamp"],
+            "summary": commit_info["summary"]
+        })
+        await broadcast_event("LOCK_STATE_CHANGED", {"file_path": req.file_path, "state": current_file_state, "action": "COMMITTED"})
+        await broadcast_event("WORKSPACE_CHANGED", {"action": "MODIFY", "path": req.file_path})
+
+        return {"success": True, "commit": commit_info, "state": current_file_state}
+    except HTTPException:
+        raise
+    except PathSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/file/commits")
+def get_file_commits(path: str, session: Dict[str, Any] = Depends(get_current_session)):
+    lm: FileLockManager = SERVER_STATE["lock_manager"]
+    if not lm:
+        raise HTTPException(status_code=503, detail="Lock manager not initialized.")
+    try:
+        SERVER_STATE["fs"].resolve_safe_path(path)
+        return lm.get_commit_history(path)
     except PathSecurityError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:

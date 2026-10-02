@@ -56,7 +56,14 @@ class ActivityLogger:
             """, (now, event_type, user_name, client_id, file_path, details))
             event_id = cursor.lastrowid
 
-            if file_path and event_type in ["FILE_OPENED", "FILE_PREVIEWED", "FILE_DOWNLOADED", "FILE_COPIED", "FILE_CREATED", "FILE_RENAMED", "FILE_MOVED", "FILE_DELETED", "FILE_UPLOADED"]:
+            lock_and_file_events = [
+                "FILE_OPENED", "FILE_PREVIEWED", "FILE_DOWNLOADED", "FILE_COPIED",
+                "FILE_CREATED", "FILE_RENAMED", "FILE_MOVED", "FILE_DELETED", "FILE_UPLOADED",
+                "WRITE_REQUESTED", "WRITE_GRANTED", "WRITE_DENIED", "WRITE_CANCELLED",
+                "LOCK_CREATED", "LOCK_REVOKED", "LOCK_RELEASED",
+                "COMMIT_STARTED", "COMMIT_CREATED", "COMMIT_REJECTED"
+            ]
+            if file_path and event_type in lock_and_file_events:
                 cursor.execute("""
                     INSERT INTO access_history (timestamp, user_name, file_path, action)
                     VALUES (?, ?, ?, ?)

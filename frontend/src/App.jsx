@@ -35,7 +35,11 @@ import {
   Sliders,
   X,
   Shield,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Lock,
+  Unlock,
+  GitCommit,
+  ListOrdered
 } from "lucide-react";
 
 // Local storage keys
@@ -147,6 +151,12 @@ export default function App() {
   const [modalHostControl, setModalHostControl] = useState(false);
   const [modalStopConfirm, setModalStopConfirm] = useState(false);
   const [maximizedPanel, setMaximizedPanel] = useState(null);
+
+  // Phase 3: Lock, Queue, and Commit Dialogs
+  const [modalEditQueue, setModalEditQueue] = useState(null); // File object
+  const [modalCommit, setModalCommit] = useState(null); // { file, lockId, baseVersion, content, summary }
+  const [modalRevokeConfirm, setModalRevokeConfirm] = useState(null); // File object
+  const [modalReleaseConfirm, setModalReleaseConfirm] = useState(null); // File object
 
   // Refs for WebSockets & Reconnect Exponential Backoff
   const fileInputRef = useRef(null);
@@ -288,6 +298,39 @@ export default function App() {
         } else if (msg.type === "USER_LEFT") {
           setConnectedUsers((prev) => prev.filter((u) => u.client_id !== msg.payload.client_id));
           fetchActivity();
+        } else if (msg.type === "LOCK_STATE_CHANGED") {
+          fetchActivity();
+          if (activeFile && msg.payload.file_path === activeFile.path) {
+            setFileMetadata((prev) => prev ? {
+              ...prev,
+              lock_state: msg.payload.state.state,
+              version: msg.payload.state.version,
+              writer: msg.payload.state.writer,
+              queue: msg.payload.state.queue,
+              queue_count: msg.payload.state.queue_count
+            } : prev);
+          }
+          if (modalEditQueue && modalEditQueue.path === msg.payload.file_path) {
+            setModalEditQueue((prev) => ({
+              ...prev,
+              lock_state: msg.payload.state.state,
+              version: msg.payload.state.version,
+              writer: msg.payload.state.writer,
+              queue: msg.payload.state.queue,
+              queue_count: msg.payload.state.queue_count
+            }));
+          }
+        } else if (msg.type === "FILE_COMMITTED") {
+          addToast(`${msg.payload.file_path} committed (Version ${msg.payload.version}) by ${msg.payload.author}`, "info");
+          fetchActivity();
+          if (activeFile && activeFile.path === msg.payload.file_path) {
+            fetch(`${serverUrl}/api/file/preview?path=${encodeURIComponent(activeFile.path)}`, {
+              headers: { Authorization: `Bearer ${token}` }
+            }).then((r) => r.ok && r.json().then(setFilePreview)).catch(() => {});
+            fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(activeFile.path)}`, {
+              headers: { Authorization: `Bearer ${token}` }
+            }).then((r) => r.ok && r.json().then(setFileMetadata)).catch(() => {});
+          }
         } else if (msg.type === "SERVER_STOPPED") {
           addToast("The host ended the shared workspace.", "warning");
           handleDisconnect();
@@ -573,6 +616,233 @@ export default function App() {
       }
     } catch (err) {
       addToast(`Failed to stop server: ${err.message}`, "error");
+    }
+  };
+
+  // --- Phase 3: Lock, Queue & Commit Handlers ---
+
+  const handleRequestWriteAccess = async (fileItem) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/lock/request`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ file_path: fileItem.path })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Request failed");
+      if (data.action === "GRANTED") {
+        addToast(`Write access granted for ${fileItem.name}!`, "success");
+      } else if (data.action === "QUEUED") {
+        addToast(`You are queued for ${fileItem.name}`, "info");
+      } else {
+        addToast(`Lock status: ${data.action}`, "info");
+      }
+      // Refresh metadata
+      if (activeFile?.path === fileItem.path) {
+        const metaRes = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(fileItem.path)}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (metaRes.ok) setFileMetadata(await metaRes.json());
+      }
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  const handleCancelWriteRequest = async (fileItem) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/lock/cancel`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ file_path: fileItem.path })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to cancel request");
+      addToast(`Cancelled write request for ${fileItem.name}`, "info");
+      if (activeFile?.path === fileItem.path) {
+        const metaRes = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(fileItem.path)}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (metaRes.ok) setFileMetadata(await metaRes.json());
+      }
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  const handleReleaseWriteAccess = async (fileItem, lockId) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/lock/release`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ file_path: fileItem.path, lock_id: lockId })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to release lock");
+      addToast(`Released write access for ${fileItem.name}`, "info");
+      setModalReleaseConfirm(null);
+      if (activeFile?.path === fileItem.path) {
+        const metaRes = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(fileItem.path)}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (metaRes.ok) setFileMetadata(await metaRes.json());
+      }
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  const handleHostGrant = async (filePath, targetClientId) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/lock/host/grant`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ file_path: filePath, target_client_id: targetClientId })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to grant access");
+      addToast(`Granted edit access`, "success");
+      // Refresh modal and metadata
+      const metaRes = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(filePath)}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (metaRes.ok) {
+        const updated = await metaRes.json();
+        setFileMetadata(updated);
+        setModalEditQueue((prev) => prev ? { ...prev, ...updated } : null);
+      }
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  const handleHostDeny = async (filePath, targetClientId) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/lock/host/deny`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ file_path: filePath, target_client_id: targetClientId })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to deny request");
+      addToast(`Denied write request`, "info");
+      const metaRes = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(filePath)}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (metaRes.ok) {
+        const updated = await metaRes.json();
+        setFileMetadata(updated);
+        setModalEditQueue((prev) => prev ? { ...prev, ...updated } : null);
+      }
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  const handleHostReorder = async (filePath, targetClientId, direction) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/lock/host/reorder`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ file_path: filePath, target_client_id: targetClientId, direction })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to reorder queue");
+      const metaRes = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(filePath)}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (metaRes.ok) {
+        const updated = await metaRes.json();
+        setFileMetadata(updated);
+        setModalEditQueue((prev) => prev ? { ...prev, ...updated } : null);
+      }
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  const handleHostRevoke = async (filePath) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/lock/host/revoke`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ file_path: filePath })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to revoke lock");
+      addToast(`Revoked write lock`, "warning");
+      setModalRevokeConfirm(null);
+      const metaRes = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(filePath)}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (metaRes.ok) {
+        const updated = await metaRes.json();
+        setFileMetadata(updated);
+        setModalEditQueue((prev) => prev ? { ...prev, ...updated } : null);
+      }
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  const handleExecuteCommit = async (filePath, lockId, content, summary, releaseLock = true) => {
+    try {
+      const res = await fetch(`${serverUrl}/api/file/commit`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          file_path: filePath,
+          lock_id: lockId,
+          content: content,
+          summary: summary || "",
+          release_lock: releaseLock
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Commit failed");
+      addToast(`Committed Version ${data.commit.version_number} successfully!`, "success");
+      setModalCommit(null);
+      loadDirectory(currentPath);
+      fetchActivity();
+      // Reload preview and meta
+      if (activeFile?.path === filePath) {
+        const [metaRes, prevRes] = await Promise.all([
+          fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(filePath)}`, {
+            headers: { Authorization: `Bearer ${token}` }
+          }),
+          fetch(`${serverUrl}/api/file/preview?path=${encodeURIComponent(filePath)}`, {
+            headers: { Authorization: `Bearer ${token}` }
+          })
+        ]);
+        if (metaRes.ok) setFileMetadata(await metaRes.json());
+        if (prevRes.ok) setFilePreview(await prevRes.json());
+      }
+    } catch (err) {
+      addToast(err.message, "error");
     }
   };
 
@@ -1457,14 +1727,121 @@ export default function App() {
                           </div>
                         </div>
 
-                        {fileMetadata?.current_viewers && fileMetadata.current_viewers.length > 0 && (
-                          <div style={{ display: "flex", alignItems: "center", gap: "6px", backgroundColor: "var(--bg-surface)", padding: "3px 8px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", fontSize: "11px" }}>
-                            <Users size={12} color="var(--status-green)" />
-                            <span>Currently Viewing:</span>
-                            <strong>{fileMetadata.current_viewers.map((v) => v.user_name).join(", ")}</strong>
-                          </div>
-                        )}
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                          {!activeFile.is_dir && fileMetadata && (
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                              <span className="badge-lock" style={{ fontFamily: "var(--font-mono)", fontSize: "10px" }}>
+                                v{fileMetadata.version || 1}
+                              </span>
+                              <span className={`badge-lock ${fileMetadata.lock_state === "LOCKED" ? "locked" : fileMetadata.lock_state === "LOCK_REQUESTED" ? "requested" : "available"}`}>
+                                {fileMetadata.lock_state === "LOCKED" ? <Lock size={10} /> : <Unlock size={10} />}
+                                {fileMetadata.lock_state || "AVAILABLE"}
+                              </span>
+                            </div>
+                          )}
+
+                          {fileMetadata?.current_viewers && fileMetadata.current_viewers.length > 0 && (
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px", backgroundColor: "var(--bg-surface)", padding: "3px 8px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", fontSize: "11px" }}>
+                              <Users size={12} color="var(--status-green)" />
+                              <span>{fileMetadata.current_viewers.length} viewing</span>
+                            </div>
+                          )}
+                        </div>
                       </div>
+
+                      {/* Phase 3: Collaboration & Locking Action Strip */}
+                      {!activeFile.is_dir && fileMetadata && (
+                        <div style={{ padding: "8px 14px", backgroundColor: "var(--bg-surface)", borderBottom: "1px solid var(--border-light)", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "8px" }}>
+                          <div style={{ fontSize: "12px", display: "flex", alignItems: "center", gap: "8px" }}>
+                            {fileMetadata.writer ? (
+                              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span style={{ color: "var(--status-amber)", fontWeight: 600 }}>● {fileMetadata.writer.user_name}</span>
+                                <span style={{ color: "var(--text-muted)" }}>(Writer, base v{fileMetadata.writer.base_version})</span>
+                              </div>
+                            ) : (
+                              <span style={{ color: "var(--status-green)" }}>● File is Available for editing</span>
+                            )}
+                            {fileMetadata.queue_count > 0 && (
+                              <span style={{ color: "var(--text-secondary)", fontSize: "11px" }}>
+                                • {fileMetadata.queue_count} waiting in queue
+                              </span>
+                            )}
+                          </div>
+
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                            {/* If current user is the writer */}
+                            {fileMetadata.writer?.client_id === session?.client_id ? (
+                              <>
+                                <button
+                                  className="btn-secondary"
+                                  style={{ padding: "3px 8px", fontSize: "11px" }}
+                                  onClick={() => handleOpenLocally(activeFile)}
+                                >
+                                  <HardDrive size={11} /> Open Locally
+                                </button>
+                                <button
+                                  className="btn-primary"
+                                  style={{ padding: "3px 8px", fontSize: "11px" }}
+                                  onClick={() => {
+                                    setModalCommit({
+                                      file: activeFile,
+                                      lockId: fileMetadata.writer.lock_id,
+                                      baseVersion: fileMetadata.writer.base_version,
+                                      content: filePreview?.kind === "text" ? filePreview.content : "",
+                                      summary: ""
+                                    });
+                                  }}
+                                >
+                                  <GitCommit size={11} /> Commit Changes
+                                </button>
+                                <button
+                                  className="btn-secondary"
+                                  style={{ padding: "3px 8px", fontSize: "11px" }}
+                                  onClick={() => setModalReleaseConfirm(activeFile)}
+                                >
+                                  Release Access
+                                </button>
+                              </>
+                            ) : fileMetadata.queue?.some((q) => q.client_id === session?.client_id) ? (
+                              /* If current user is waiting in queue */
+                              <>
+                                <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                                  Queue Position: #{fileMetadata.queue.find((q) => q.client_id === session?.client_id)?.position}
+                                </span>
+                                <button
+                                  className="btn-secondary"
+                                  style={{ padding: "3px 8px", fontSize: "11px" }}
+                                  onClick={() => handleCancelWriteRequest(activeFile)}
+                                >
+                                  Cancel Request
+                                </button>
+                              </>
+                            ) : (
+                              /* If available or locked by someone else */
+                              <button
+                                className="btn-secondary"
+                                style={{ padding: "3px 8px", fontSize: "11px" }}
+                                onClick={() => handleRequestWriteAccess(activeFile)}
+                              >
+                                <Lock size={11} />
+                                {fileMetadata.lock_state === "LOCKED" ? "Join Queue" : "Request Edit Access"}
+                              </button>
+                            )}
+
+                            {/* Host Controls */}
+                            {session?.is_host && (
+                              <button
+                                className="btn-secondary"
+                                style={{ padding: "3px 8px", fontSize: "11px" }}
+                                title="Manage Write Requests & Queue"
+                                onClick={() => setModalEditQueue(fileMetadata)}
+                              >
+                                <ListOrdered size={11} /> Queue
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       <div style={{ flex: 1, overflow: "auto" }}>
                         {filePreview?.kind === "text" && (
@@ -1638,6 +2015,36 @@ export default function App() {
                   <Download size={14} />
                   <span>Download</span>
                 </a>
+              )}
+              {!contextMenu.item.is_dir && (
+                <div
+                  className="context-item"
+                  onClick={() => {
+                    handleRequestWriteAccess(contextMenu.item);
+                    setContextMenu(null);
+                  }}
+                >
+                  <Lock size={14} />
+                  <span>Request Edit Access</span>
+                </div>
+              )}
+
+              {!contextMenu.item.is_dir && session?.is_host && (
+                <div
+                  className="context-item"
+                  onClick={async () => {
+                    try {
+                      const res = await fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(contextMenu.item.path)}`, {
+                        headers: { Authorization: `Bearer ${token}` }
+                      });
+                      if (res.ok) setModalEditQueue(await res.json());
+                    } catch (e) {}
+                    setContextMenu(null);
+                  }}
+                >
+                  <ListOrdered size={14} />
+                  <span>Edit Queue & Locks</span>
+                </div>
               )}
 
               <div
@@ -1991,6 +2398,248 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Phase 3: Host Edit Queue Management Dialog */}
+      {modalEditQueue && (
+        <div className="modal-overlay" onClick={() => setModalEditQueue(null)}>
+          <div className="modal-window" style={{ width: "480px" }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>Edit Queue — {modalEditQueue.name} (v{modalEditQueue.version || 1})</span>
+              <button className="btn-icon" onClick={() => setModalEditQueue(null)}>
+                <X size={14} />
+              </button>
+            </div>
+            <div className="modal-body">
+              {/* Current Writer Card */}
+              <div style={{ marginBottom: "16px" }}>
+                <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", textTransform: "uppercase", marginBottom: "6px" }}>
+                  Current Writer
+                </div>
+                {modalEditQueue.writer ? (
+                  <div className="queue-card" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: "13px", color: "var(--status-amber)" }}>
+                        ● {modalEditQueue.writer.user_name}
+                      </div>
+                      <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
+                        Active lock since {formatTime(modalEditQueue.writer.created_at)} • Base Version {modalEditQueue.writer.base_version}
+                      </div>
+                    </div>
+                    {session?.is_host && (
+                      <button
+                        className="btn-secondary"
+                        style={{ padding: "3px 8px", fontSize: "11px", color: "var(--status-red)" }}
+                        onClick={() => setModalRevokeConfirm(modalEditQueue)}
+                      >
+                        Revoke Lock
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="queue-card" style={{ color: "var(--status-green)", fontSize: "12px" }}>
+                    ● No active writer. File is Available.
+                  </div>
+                )}
+              </div>
+
+              {/* Waiting Requests Queue */}
+              <div>
+                <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", textTransform: "uppercase", marginBottom: "6px", display: "flex", justifyContent: "space-between" }}>
+                  <span>Waiting Requests ({modalEditQueue.queue?.length || 0})</span>
+                  <span>Order: FIFO</span>
+                </div>
+
+                {(!modalEditQueue.queue || modalEditQueue.queue.length === 0) ? (
+                  <div style={{ textAlign: "center", padding: "16px", color: "var(--text-muted)", fontSize: "12px" }}>
+                    No pending write requests in queue.
+                  </div>
+                ) : (
+                  modalEditQueue.queue.map((req, idx) => (
+                    <div key={req.request_id} className="queue-item">
+                      <div>
+                        <div style={{ fontWeight: 500 }}>
+                          #{req.position} {req.user_name}
+                        </div>
+                        <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
+                          Requested at {formatTime(req.requested_at)} (base v{req.base_version})
+                        </div>
+                      </div>
+
+                      {session?.is_host && (
+                        <div style={{ display: "flex", gap: "4px" }}>
+                          <button
+                            className="btn-icon"
+                            title="Move Up"
+                            disabled={idx === 0}
+                            onClick={() => handleHostReorder(modalEditQueue.path, req.client_id, "up")}
+                          >
+                            <ArrowUp size={12} />
+                          </button>
+                          <button
+                            className="btn-icon"
+                            title="Move Down"
+                            disabled={idx === modalEditQueue.queue.length - 1}
+                            onClick={() => handleHostReorder(modalEditQueue.path, req.client_id, "down")}
+                          >
+                            <ArrowRight size={12} style={{ transform: "rotate(90deg)" }} />
+                          </button>
+                          {!modalEditQueue.writer && (
+                            <button
+                              className="btn-primary"
+                              style={{ padding: "2px 6px", fontSize: "10px" }}
+                              onClick={() => handleHostGrant(modalEditQueue.path, req.client_id)}
+                            >
+                              Grant
+                            </button>
+                          )}
+                          <button
+                            className="btn-secondary"
+                            style={{ padding: "2px 6px", fontSize: "10px", color: "var(--status-red)" }}
+                            onClick={() => handleHostDeny(modalEditQueue.path, req.client_id)}
+                          >
+                            Deny
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalEditQueue(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 3: Commit Changes Dialog */}
+      {modalCommit && (
+        <div className="modal-overlay" onClick={() => setModalCommit(null)}>
+          <div className="modal-window" style={{ width: "520px" }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>Commit Changes — {modalCommit.file.name}</span>
+            </div>
+            <div className="modal-body">
+              <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginBottom: "12px" }}>
+                You hold write access for <strong>{modalCommit.file.name}</strong> (Base Version: {modalCommit.baseVersion}).
+                The server will validate your lock, atomically commit content, and advance the version counter.
+              </div>
+
+              <div className="form-group">
+                <label>Commit Message / Summary</label>
+                <input
+                  type="text"
+                  className="input-text"
+                  placeholder="e.g. Updated configuration and added tests"
+                  value={modalCommit.summary}
+                  onChange={(e) => setModalCommit({ ...modalCommit, summary: e.target.value })}
+                  autoFocus
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Content to Commit</label>
+                <textarea
+                  className="input-text"
+                  style={{ height: "140px", fontFamily: "var(--font-mono)", fontSize: "11px", resize: "vertical" }}
+                  value={modalCommit.content}
+                  onChange={(e) => setModalCommit({ ...modalCommit, content: e.target.value })}
+                />
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "10px" }}>
+                <input
+                  type="checkbox"
+                  id="releaseLockAfter"
+                  defaultChecked={true}
+                  onChange={(e) => setModalCommit({ ...modalCommit, releaseLock: e.target.checked })}
+                />
+                <label htmlFor="releaseLockAfter" style={{ fontSize: "12px", cursor: "pointer" }}>
+                  Release write access after commit (allows next queued writer to edit)
+                </label>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalCommit(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() => handleExecuteCommit(modalCommit.file.path, modalCommit.lockId, modalCommit.content, modalCommit.summary, modalCommit.releaseLock !== false)}
+              >
+                <GitCommit size={13} /> Submit Commit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 3: Host Revoke Confirmation Dialog */}
+      {modalRevokeConfirm && (
+        <div className="modal-overlay" onClick={() => setModalRevokeConfirm(null)}>
+          <div className="modal-window" style={{ width: "420px" }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span style={{ color: "var(--status-red)" }}>Revoke Active Lock?</span>
+            </div>
+            <div className="modal-body">
+              <div style={{ display: "flex", gap: "10px", alignItems: "flex-start" }}>
+                <AlertTriangle size={24} color="var(--status-red)" style={{ flexShrink: 0 }} />
+                <div style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                  Revoke write access from <strong>{modalRevokeConfirm.writer?.user_name || "the current writer"}</strong>?
+                  <div style={{ marginTop: "8px" }}>
+                    The writer may have uncommitted local changes. The server will <strong>NOT</strong> automatically overwrite or delete their local copy, but their lock ID will be immediately invalidated.
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalRevokeConfirm(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                style={{ backgroundColor: "var(--status-red)", borderColor: "var(--status-red)", color: "#fff" }}
+                onClick={() => handleHostRevoke(modalRevokeConfirm.path)}
+              >
+                Revoke Access
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 3: Release Lock Warning Dialog */}
+      {modalReleaseConfirm && (
+        <div className="modal-overlay" onClick={() => setModalReleaseConfirm(null)}>
+          <div className="modal-window" style={{ width: "400px" }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>Release Edit Access?</span>
+            </div>
+            <div className="modal-body">
+              <div style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                You have active write access for <strong>{modalReleaseConfirm.name}</strong>.
+                <div style={{ marginTop: "8px" }}>
+                  If you have uncommitted local changes in your editor, they will remain safely in your local working copy, but other users will be able to request and obtain write access to the server's shared file.
+                </div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalReleaseConfirm(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() => handleReleaseWriteAccess(modalReleaseConfirm, fileMetadata?.writer?.lock_id)}
+              >
+                Release Access Anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2040,6 +2689,24 @@ function formatEventDesc(log) {
       return `deleted ${log.file_path}`;
     case "FILE_UPLOADED":
       return `uploaded ${log.file_path}`;
+    case "WRITE_REQUESTED":
+      return `requested edit access for ${log.file_path}`;
+    case "WRITE_GRANTED":
+      return `granted edit access for ${log.file_path}`;
+    case "WRITE_DENIED":
+      return `denied edit access for ${log.file_path}`;
+    case "WRITE_CANCELLED":
+      return `cancelled edit request for ${log.file_path}`;
+    case "LOCK_CREATED":
+      return `acquired lock for ${log.file_path}`;
+    case "LOCK_REVOKED":
+      return `lock revoked for ${log.file_path}`;
+    case "LOCK_RELEASED":
+      return `released lock for ${log.file_path}`;
+    case "COMMIT_CREATED":
+      return `committed new version for ${log.file_path}`;
+    case "COMMIT_REJECTED":
+      return `commit rejected for ${log.file_path}`;
     default:
       return log.details || log.event_type;
   }

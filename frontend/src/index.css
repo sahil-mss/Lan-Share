@@ -737,3 +737,66 @@ input, button, select, textarea {
 .toast-close:hover {
   color: var(--text-primary);
 }
+
+/* Phase 3: File Locking, Queue and Collaboration Badges */
+.badge-lock {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-light);
+}
+
+.badge-lock.available {
+  background-color: var(--bg-subtle);
+  color: var(--status-green);
+  border-color: rgba(46, 160, 67, 0.25);
+}
+
+.badge-lock.locked {
+  background-color: var(--bg-subtle);
+  color: var(--status-amber);
+  border-color: rgba(210, 153, 34, 0.3);
+}
+
+.badge-lock.requested {
+  background-color: var(--bg-subtle);
+  color: var(--text-secondary);
+}
+
+.queue-card {
+  padding: 10px 12px;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border-light);
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.commit-diff-box {
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
