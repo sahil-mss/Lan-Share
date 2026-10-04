@@ -39,7 +39,9 @@ import {
   Lock,
   Unlock,
   GitCommit,
-  ListOrdered
+  ListOrdered,
+  Play,
+  ArrowRightCircle
 } from "lucide-react";
 
 // Local storage keys
@@ -81,7 +83,12 @@ export default function App() {
 
   // Connection State Model: "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "RECONNECTING" | "AUTHENTICATING" | "SERVER_UNAVAILABLE"
   const [connectionStatus, setConnectionStatus] = useState("DISCONNECTED");
-  const [serverUrl, setServerUrl] = useState("http://localhost:7420");
+  const [serverUrl, setServerUrl] = useState(() => {
+    if (typeof window !== "undefined" && window.location && window.location.port) {
+      return `${window.location.protocol}//${window.location.hostname}:${window.location.port}`;
+    }
+    return "http://localhost:7420";
+  });
   const [token, setToken] = useState(null);
   const [session, setSession] = useState(null);
   const [workspaceInfo, setWorkspaceInfo] = useState(null);
@@ -107,16 +114,29 @@ export default function App() {
 
   // Launcher state
   const [activeTab, setActiveTab] = useState("host"); // "host" | "join" | "discovered"
-  const [hostName, setHostName] = useState("Sahil");
-  const [workspaceName, setWorkspaceName] = useState("My Project");
-  const [sharedRoot, setSharedRoot] = useState("D:\\Projects\\LanShare");
-  const [hostPassword, setHostPassword] = useState("secret123");
-  const [hostPort, setHostPort] = useState(7420);
+  const [hostName, setHostName] = useState("");
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [sharedRoot, setSharedRoot] = useState("");
+  const [selectedFolderPreview, setSelectedFolderPreview] = useState(null); // { path, items, total_count }
+  const [hostPassword, setHostPassword] = useState("");
+  const [hostPort, setHostPort] = useState(() => {
+    if (typeof window !== "undefined" && window.location && window.location.port) {
+      const p = parseInt(window.location.port, 10);
+      if (!isNaN(p)) return p;
+    }
+    return 7420;
+  });
 
   // Join state
-  const [joinAddress, setJoinAddress] = useState("localhost:7420");
-  const [joinUserName, setJoinUserName] = useState("Alex");
-  const [joinPassword, setJoinPassword] = useState("secret123");
+  const [joinAddress, setJoinAddress] = useState(() => {
+    if (typeof window !== "undefined" && window.location && window.location.port) {
+      return `${window.location.hostname}:${window.location.port}`;
+    }
+    return "";
+  });
+  const [joinUserName, setJoinUserName] = useState("");
+  const [joinPassword, setJoinPassword] = useState("");
+  const [joinPasswordRequired, setJoinPasswordRequired] = useState(null); // null: unknown, true/false: known
   const [errorMessage, setErrorMessage] = useState("");
 
   // Workspace File Explorer state
@@ -158,6 +178,12 @@ export default function App() {
   const [modalRevokeConfirm, setModalRevokeConfirm] = useState(null); // File object
   const [modalReleaseConfirm, setModalReleaseConfirm] = useState(null); // File object
 
+  // Phase 4: LANShare Local Client integration state
+  const [localClientStatus, setLocalClientStatus] = useState(null); // { status: "ONLINE", token, client_id, local_port }
+  const [localTrackedFiles, setLocalTrackedFiles] = useState({}); // { [shared_path]: trackedObject }
+  const [modalConflictResolution, setModalConflictResolution] = useState(null); // trackedObject
+
+
   // Refs for WebSockets & Reconnect Exponential Backoff
   const fileInputRef = useRef(null);
   const wsRef = useRef(null);
@@ -165,6 +191,9 @@ export default function App() {
   const reconnectTimeoutRef = useRef(null);
   const pingIntervalRef = useRef(null);
   const isDraggingRef = useRef(null);
+  const previewAbortRef = useRef(null);
+  const dirAbortRef = useRef(null);
+  const currentPathRef = useRef("");
 
   // Theme application
   useEffect(() => {
@@ -178,40 +207,75 @@ export default function App() {
     }
   }, [theme]);
 
-  // Periodic LAN discovery polling when on launcher
+  // Phase 4: Periodic Local Client discovery and tracking state poll
   useEffect(() => {
-    if (session) return;
-    const checkStatus = async () => {
+    let active = true;
+    const probeLocalClient = async () => {
       try {
-        const res = await fetch(`${serverUrl}/api/status`);
+        const res = await fetch("http://127.0.0.1:7430/status", { method: "GET" });
         if (res.ok) {
           const data = await res.json();
-          if (data.discovered_lan_workspaces) {
-            setDiscoveredServers(data.discovered_lan_workspaces);
+          if (active) setLocalClientStatus(data);
+          // If session is active, fetch tracked files for current server
+          if (session && data.token) {
+            try {
+              const wsRes = await fetch(`http://127.0.0.1:7430/workspaces?server_url=${encodeURIComponent(serverUrl)}`, {
+                headers: { Authorization: `Bearer ${data.token}` }
+              });
+              if (wsRes.ok) {
+                const wsData = await wsRes.json();
+                const map = {};
+                (wsData.files || []).forEach((f) => {
+                  map[f.shared_path] = f;
+                });
+                if (active) setLocalTrackedFiles(map);
+              }
+            } catch (e) {}
           }
+        } else {
+          if (active) setLocalClientStatus(null);
         }
-      } catch (err) {}
+      } catch (err) {
+        if (active) setLocalClientStatus(null);
+      }
     };
-    checkStatus();
-    const interval = setInterval(checkStatus, 3000);
-    return () => clearInterval(interval);
-  }, [serverUrl, session]);
 
-  // Load files for directory
-  const loadDirectory = useCallback(async (path) => {
+    probeLocalClient();
+    const interval = setInterval(probeLocalClient, 3000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [session, serverUrl]);
+
+
+  // Load files for directory with in-flight cancellation and path validation
+  const loadDirectory = useCallback(async (path = "") => {
+    const cleanPath = (path || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    currentPathRef.current = cleanPath;
+
+    if (dirAbortRef.current) {
+      dirAbortRef.current.abort();
+    }
+    const abortCtrl = new AbortController();
+    dirAbortRef.current = abortCtrl;
+
     try {
-      const res = await fetch(`${serverUrl}/api/files?path=${encodeURIComponent(path)}`, {
-        headers: { Authorization: `Bearer ${token}` }
+      const res = await fetch(`${serverUrl}/api/files?path=${encodeURIComponent(cleanPath)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: abortCtrl.signal
       });
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.detail || "Failed to load files");
       }
       const data = await res.json();
-      setFiles(data.items);
-      setCurrentPath(data.current_path);
+      setFiles(data.items || []);
+      setCurrentPath(data.current_path != null ? data.current_path : cleanPath);
     } catch (err) {
-      console.error(err);
+      if (err.name !== "AbortError") {
+        console.error("Directory load error:", err);
+      }
     }
   }, [serverUrl, token]);
 
@@ -249,7 +313,7 @@ export default function App() {
       socket.send(JSON.stringify({ token }));
 
       // State recovery after reconnection
-      loadDirectory(currentPath);
+      loadDirectory(currentPathRef.current);
       fetchActivity();
 
       if (activeFile) {
@@ -285,7 +349,7 @@ export default function App() {
         } else if (msg.type === "USERS_UPDATE") {
           setConnectedUsers(msg.payload);
         } else if (msg.type === "WORKSPACE_CHANGED") {
-          loadDirectory(currentPath);
+          loadDirectory(currentPathRef.current);
           fetchActivity();
           if (msg.payload.action === "DELETE" && msg.payload.paths?.includes(activeFile?.path)) {
             setActiveFile(null);
@@ -360,7 +424,7 @@ export default function App() {
     socket.onerror = () => {
       socket.close();
     };
-  }, [token, serverUrl, currentPath, activeFile, loadDirectory, fetchActivity, addToast]);
+  }, [token, serverUrl, activeFile, loadDirectory, fetchActivity, addToast]);
 
   useEffect(() => {
     if (token) {
@@ -373,21 +437,37 @@ export default function App() {
     };
   }, [token, setupWebSocket]);
 
-  // Navigate folder
+  // Navigate folder with clean normalization and history sync
   const navigateTo = (path) => {
-    loadDirectory(path);
+    const cleanPath = (path || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    loadDirectory(cleanPath);
     setSelectedPaths([]);
-    const newHist = history.slice(0, historyIdx + 1);
-    newHist.push(path);
-    setHistory(newHist);
-    setHistoryIdx(newHist.length - 1);
+    setActiveFile(null);
+    setFilePreview(null);
+    setFileMetadata(null);
+
+    setHistory((prev) => {
+      const currentEntry = prev[historyIdx];
+      if (currentEntry === cleanPath) return prev;
+      const sliced = prev.slice(0, historyIdx + 1);
+      return [...sliced, cleanPath];
+    });
+    setHistoryIdx((prev) => {
+      const currentEntry = history[prev];
+      return currentEntry === cleanPath ? prev : prev + 1;
+    });
   };
 
   const goBack = () => {
     if (historyIdx > 0) {
       const newIdx = historyIdx - 1;
       setHistoryIdx(newIdx);
-      loadDirectory(history[newIdx]);
+      const targetPath = history[newIdx] || "";
+      loadDirectory(targetPath);
+      setSelectedPaths([]);
+      setActiveFile(null);
+      setFilePreview(null);
+      setFileMetadata(null);
     }
   };
 
@@ -395,15 +475,22 @@ export default function App() {
     if (historyIdx < history.length - 1) {
       const newIdx = historyIdx + 1;
       setHistoryIdx(newIdx);
-      loadDirectory(history[newIdx]);
+      const targetPath = history[newIdx] || "";
+      loadDirectory(targetPath);
+      setSelectedPaths([]);
+      setActiveFile(null);
+      setFilePreview(null);
+      setFileMetadata(null);
     }
   };
 
   const goUp = () => {
-    if (!currentPath) return;
-    const parts = currentPath.split("/").filter(Boolean);
+    const active = currentPathRef.current || currentPath || "";
+    if (!active) return;
+    const parts = active.split("/").filter(Boolean);
     parts.pop();
-    navigateTo(parts.join("/"));
+    const parent = parts.join("/");
+    navigateTo(parent);
   };
 
   // Select and Preview File
@@ -446,21 +533,49 @@ export default function App() {
       wsRef.current.send(JSON.stringify({ action: "VIEW_FILE", path: item.path }));
     }
 
+    if (previewAbortRef.current) {
+      previewAbortRef.current.abort();
+    }
+    const abortCtrl = new AbortController();
+    previewAbortRef.current = abortCtrl;
+
     try {
       const [metaRes, prevRes] = await Promise.all([
         fetch(`${serverUrl}/api/file/metadata?path=${encodeURIComponent(item.path)}`, {
-          headers: { Authorization: `Bearer ${token}` }
+          headers: { Authorization: `Bearer ${token}` },
+          signal: abortCtrl.signal
         }),
         fetch(`${serverUrl}/api/file/preview?path=${encodeURIComponent(item.path)}`, {
-          headers: { Authorization: `Bearer ${token}` }
+          headers: { Authorization: `Bearer ${token}` },
+          signal: abortCtrl.signal
         })
       ]);
 
       if (metaRes.ok) setFileMetadata(await metaRes.json());
       if (prevRes.ok) setFilePreview(await prevRes.json());
-      fetchActivity();
     } catch (err) {
-      console.error(err);
+      if (err.name !== "AbortError") {
+        console.error(err);
+      }
+    }
+  };
+
+  const handlePickleBinary = async (file, enablePickle) => {
+    if (!file) return;
+    try {
+      const url = `${serverUrl}/api/file/preview?path=${encodeURIComponent(file.path)}${enablePickle ? "&pickle=true" : ""}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setFilePreview(data);
+        if (enablePickle) {
+          addToast(`Loaded pickle inspection for ${file.name}`, "info");
+        }
+      }
+    } catch (err) {
+      addToast(`Pickle error: ${err.message}`, "error");
     }
   };
 
@@ -505,6 +620,118 @@ export default function App() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [session, selectedPaths, files, activeFile, currentPath]);
+
+  // Browse Folder helper & preview
+  const [isBrowsingFolder, setIsBrowsingFolder] = useState(false);
+  const folderInputRef = useRef(null);
+
+  const fetchFolderContents = async (pathStr) => {
+    if (!pathStr || !pathStr.trim()) {
+      setSelectedFolderPreview(null);
+      return;
+    }
+    try {
+      const res = await fetch(`${serverUrl}/api/system/inspect-folder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: pathStr.trim() })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.exists) {
+          setSelectedFolderPreview({
+            path: pathStr.trim(),
+            items: data.items || [],
+            total_count: data.total_count || 0
+          });
+          return;
+        }
+      }
+    } catch (e) {}
+    setSelectedFolderPreview(null);
+  };
+
+  const handleBrowseFolder = async () => {
+    setIsBrowsingFolder(true);
+    try {
+      const res = await fetch(`${serverUrl}/api/system/browse-folder`, {
+        method: "POST"
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.path) {
+          setSharedRoot(data.path);
+          if (!workspaceName) {
+            const parts = data.path.replace(/\\/g, "/").split("/").filter(Boolean);
+            if (parts.length > 0) {
+              setWorkspaceName(parts[parts.length - 1]);
+            }
+          }
+          if (data.items) {
+            setSelectedFolderPreview({
+              path: data.path,
+              items: data.items,
+              total_count: data.total_count || data.items.length
+            });
+          } else {
+            fetchFolderContents(data.path);
+          }
+          setIsBrowsingFolder(false);
+          return;
+        }
+      }
+    } catch (err) {
+      // Server not reachable or error, fallback to HTML directory input picker
+    }
+    setIsBrowsingFolder(false);
+
+    // Fallback: trigger hidden directory picker to let user browse
+    if (folderInputRef.current) {
+      folderInputRef.current.click();
+    }
+  };
+
+  const handleFolderInputFallback = (e) => {
+    const filesList = e.target.files;
+    if (filesList && filesList.length > 0) {
+      const firstFile = filesList[0];
+      const items = Array.from(filesList).slice(0, 30).map((f) => ({
+        name: f.name,
+        is_dir: false,
+        type: f.name.split(".").pop() || "file"
+      }));
+
+      // On Chromium browsers / Electron, firstFile.path provides local absolute path
+      if (firstFile.path) {
+        const folderPath = firstFile.path.substring(0, firstFile.path.lastIndexOf(firstFile.name)).replace(/[\\/]$/, "");
+        if (folderPath) {
+          setSharedRoot(folderPath);
+          setSelectedFolderPreview({
+            path: folderPath,
+            items,
+            total_count: filesList.length
+          });
+          if (!workspaceName) {
+            const parts = folderPath.replace(/\\/g, "/").split("/").filter(Boolean);
+            if (parts.length > 0) setWorkspaceName(parts[parts.length - 1]);
+          }
+          return;
+        }
+      }
+      // If webkitRelativePath is available
+      if (firstFile.webkitRelativePath) {
+        const rootDir = firstFile.webkitRelativePath.split("/")[0];
+        if (rootDir && !workspaceName) {
+          setWorkspaceName(rootDir);
+        }
+        setSelectedFolderPreview({
+          path: rootDir,
+          items,
+          total_count: filesList.length
+        });
+      }
+    }
+  };
 
   // Host Server submit
   const handleHostServer = async (e) => {
@@ -1044,7 +1271,7 @@ export default function App() {
     }
   };
 
-  // Open Locally
+  // Phase 4: Open Locally via Local Client (or fallback)
   const handleOpenLocally = async (items) => {
     const list = Array.isArray(items) ? items : [items];
     const defaultLocalBase = localStorage.getItem(STORAGE_LOCAL_ROOT) || "C:\\Users\\Sahil\\LANShare_Workspace";
@@ -1052,8 +1279,52 @@ export default function App() {
     for (const item of list) {
       if (item.is_dir) continue;
       const localTarget = `${defaultLocalBase}\\${item.path.replace(/\//g, "\\")}`;
-      window.open(`${serverUrl}/api/file/download?path=${encodeURIComponent(item.path)}`, "_blank");
 
+      // If Local Client is running, use its /open API
+      if (localClientStatus?.token) {
+        try {
+          // Register session first
+          await fetch("http://127.0.0.1:7430/register_session", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${localClientStatus.token}`
+            },
+            body: JSON.stringify({ server_url: serverUrl, token: token })
+          });
+
+          const openRes = await fetch("http://127.0.0.1:7430/open", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${localClientStatus.token}`
+            },
+            body: JSON.stringify({
+              server_url: serverUrl,
+              shared_path: item.path,
+              local_path: localTarget,
+              token: token
+            })
+          });
+          if (openRes.ok) {
+            const openData = await openRes.json();
+            if (openData.tracked) {
+              setLocalTrackedFiles((prev) => ({
+                ...prev,
+                [item.path]: openData.tracked
+              }));
+            }
+          }
+        } catch (clientErr) {
+          console.warn("Local client open failed, using browser download fallback", clientErr);
+          window.open(`${serverUrl}/api/file/download?path=${encodeURIComponent(item.path)}`, "_blank");
+        }
+      } else {
+        // Fallback: browser download
+        window.open(`${serverUrl}/api/file/download?path=${encodeURIComponent(item.path)}`, "_blank");
+      }
+
+      // Track on server
       try {
         await fetch(`${serverUrl}/api/file/track_local_copy`, {
           method: "POST",
@@ -1072,6 +1343,92 @@ export default function App() {
     fetchActivity();
     addToast(`Tracked ${list.length} file(s) for local copy at ${defaultLocalBase}`, "info");
   };
+
+  // Phase 4: Local Client Pull Server Version
+  const handleClientPull = async (tracked, force = false) => {
+    if (!localClientStatus?.token || !tracked) return;
+    try {
+      const res = await fetch("http://127.0.0.1:7430/pull", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localClientStatus.token}`
+        },
+        body: JSON.stringify({
+          local_path: tracked.local_path,
+          force_overwrite: force
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || "Pull failed");
+      }
+      setLocalTrackedFiles((prev) => ({
+        ...prev,
+        [tracked.shared_path]: data.tracked
+      }));
+      setModalConflictResolution(null);
+      addToast(`Updated local copy of ${tracked.shared_path} to latest server version.`, "success");
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  // Phase 4: Local Client Commit Local File
+  const handleClientCommit = async (tracked, releaseLock = false) => {
+    if (!localClientStatus?.token || !tracked) return;
+    try {
+      const res = await fetch("http://127.0.0.1:7430/commit", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localClientStatus.token}`
+        },
+        body: JSON.stringify({
+          local_path: tracked.local_path,
+          summary: "Local external editor commit",
+          release_lock: releaseLock
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || "Commit failed");
+      }
+      setLocalTrackedFiles((prev) => ({
+        ...prev,
+        [tracked.shared_path]: data.tracked
+      }));
+      addToast(`Committed changes for ${tracked.shared_path} successfully.`, "success");
+      loadDirectory(currentPath);
+      fetchActivity();
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
+  // Phase 4: Stop Tracking Local Copy
+  const handleStopTracking = async (tracked) => {
+    if (!localClientStatus?.token || !tracked) return;
+    try {
+      await fetch("http://127.0.0.1:7430/stop_tracking", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localClientStatus.token}`
+        },
+        body: JSON.stringify({ local_path: tracked.local_path })
+      });
+      setLocalTrackedFiles((prev) => {
+        const next = { ...prev };
+        delete next[tracked.shared_path];
+        return next;
+      });
+      addToast(`Stopped tracking ${tracked.shared_path}`, "info");
+    } catch (err) {
+      addToast(err.message, "error");
+    }
+  };
+
 
   // Interactive Resizer Event Handlers
   const handleMouseDownSplitter = (type) => (e) => {
@@ -1116,27 +1473,32 @@ export default function App() {
     };
   }, [layout]);
 
-  // Filter and Sort files
-  const filteredFiles = files
-    .filter((f) => f.name.toLowerCase().includes(searchQuery.toLowerCase()))
-    .sort((a, b) => {
-      if (a.is_dir && !b.is_dir) return -1;
-      if (!a.is_dir && b.is_dir) return 1;
-      let valA = a[sortBy];
-      let valB = b[sortBy];
-      if (typeof valA === "string") valA = valA.toLowerCase();
-      if (typeof valB === "string") valB = valB.toLowerCase();
-      if (valA < valB) return sortAsc ? -1 : 1;
-      if (valA > valB) return sortAsc ? 1 : -1;
-      return 0;
-    });
+  // Filter and Sort files (Memoized for high UI responsiveness)
+  const filteredFiles = React.useMemo(() => {
+    const q = searchQuery.toLowerCase();
+    return files
+      .filter((f) => !q || f.name.toLowerCase().includes(q))
+      .sort((a, b) => {
+        if (a.is_dir && !b.is_dir) return -1;
+        if (!a.is_dir && b.is_dir) return 1;
+        let valA = a[sortBy];
+        let valB = b[sortBy];
+        if (typeof valA === "string") valA = valA.toLowerCase();
+        if (typeof valB === "string") valB = valB.toLowerCase();
+        if (valA < valB) return sortAsc ? -1 : 1;
+        if (valA > valB) return sortAsc ? 1 : -1;
+        return 0;
+      });
+  }, [files, searchQuery, sortBy, sortAsc]);
 
-  // Filtered Activity
-  const filteredActivityLogs = activityLogs.filter((log) => {
-    if (activityFilter === "FILES") return log.file_path != null;
-    if (activityFilter === "USERS") return log.event_type.startsWith("USER_") || log.event_type.startsWith("AUTH_");
-    return true;
-  });
+  // Filtered Activity (Memoized)
+  const filteredActivityLogs = React.useMemo(() => {
+    return activityLogs.filter((log) => {
+      if (activityFilter === "FILES") return log.file_path != null;
+      if (activityFilter === "USERS") return log.event_type.startsWith("USER_") || log.event_type.startsWith("AUTH_");
+      return true;
+    });
+  }, [activityLogs, activityFilter]);
 
   // Deep Breadcrumb Collapse
   const breadcrumbSegments = currentPath.split("/").filter(Boolean);
@@ -1291,8 +1653,15 @@ export default function App() {
         <main className="launcher-screen">
           <div className="launcher-card">
             <div className="launcher-header">
-              <h1 className="launcher-title">LANShare Workspace</h1>
-              <p className="launcher-subtitle">Share folders securely across your local network without cloud storage.</p>
+              <div className="launcher-header-row">
+                <div className="launcher-app-icon" title="LANShare Application">
+                  <HardDrive size={22} strokeWidth={2.2} />
+                </div>
+                <div>
+                  <h1 className="launcher-title">LANShare Workspace</h1>
+                  <p className="launcher-subtitle">Share folders securely across your local network without cloud storage.</p>
+                </div>
+              </div>
             </div>
 
             <div className="launcher-tabs">
@@ -1331,27 +1700,121 @@ export default function App() {
                     className="form-input"
                     value={workspaceName}
                     onChange={(e) => setWorkspaceName(e.target.value)}
+                    placeholder="e.g. My Shared Project"
                     required
                   />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">Shared Folder (Strict Security Root)</label>
-                  <input
-                    className="form-input"
-                    value={sharedRoot}
-                    onChange={(e) => setSharedRoot(e.target.value)}
-                    placeholder="e.g. D:\Projects\MyProject"
-                    required
-                  />
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                    <label className="form-label">Shared Folder (Strict Security Root)</label>
+                    <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>Click Browse to choose from files</span>
+                  </div>
+                  <div style={{ display: "flex", gap: "8px", alignItems: "stretch" }}>
+                    <input
+                      className="form-input"
+                      value={sharedRoot}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSharedRoot(val);
+                        fetchFolderContents(val);
+                      }}
+                      placeholder="e.g. D:\Projects\MyProject or choose via Browse..."
+                      required
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={handleBrowseFolder}
+                      disabled={isBrowsingFolder}
+                      title="Browse computer folders"
+                      style={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap", padding: "0 14px", height: "auto" }}
+                    >
+                      <FolderOpen size={16} />
+                      <span>{isBrowsingFolder ? "Browsing..." : "Browse..."}</span>
+                    </button>
+                    {/* Hidden input for webkitdirectory browser fallback */}
+                    <input
+                      type="file"
+                      ref={folderInputRef}
+                      onChange={handleFolderInputFallback}
+                      webkitdirectory=""
+                      directory=""
+                      style={{ display: "none" }}
+                    />
+                  </div>
+
+                  {/* Live Folder Contents Preview on screen */}
+                  {selectedFolderPreview && (
+                    <div
+                      style={{
+                        marginTop: "8px",
+                        padding: "8px 10px",
+                        backgroundColor: "var(--bg-tertiary)",
+                        border: "1px solid var(--border-light)",
+                        borderRadius: "var(--radius-sm)",
+                        fontSize: "11px"
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                        <span style={{ fontWeight: 600, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: "4px" }}>
+                          <FolderOpen size={13} color="var(--brand-primary)" />
+                          Folder Contents ({selectedFolderPreview.total_count} items):
+                        </span>
+                        <span style={{ color: "var(--text-muted)", fontSize: "10px" }}>
+                          {selectedFolderPreview.items.length < selectedFolderPreview.total_count ? `showing first ${selectedFolderPreview.items.length}` : "all visible"}
+                        </span>
+                      </div>
+                      <div
+                        style={{
+                          maxHeight: "120px",
+                          overflowY: "auto",
+                          display: "grid",
+                          gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                          gap: "4px"
+                        }}
+                      >
+                        {selectedFolderPreview.items.map((it, idx) => (
+                          <div
+                            key={idx}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "6px",
+                              padding: "3px 6px",
+                              backgroundColor: "var(--bg-primary)",
+                              borderRadius: "3px",
+                              border: "1px solid var(--border-light)",
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis"
+                            }}
+                            title={it.name}
+                          >
+                            {it.is_dir ? <Folder size={12} color="var(--text-secondary)" /> : <File size={12} color="var(--text-muted)" />}
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{it.name}</span>
+                          </div>
+                        ))}
+                        {selectedFolderPreview.items.length === 0 && (
+                          <div style={{ color: "var(--text-muted)", fontStyle: "italic", padding: "4px" }}>
+                            Folder is empty.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
                 <div className="form-group">
-                  <label className="form-label">Password Protection</label>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                    <label className="form-label">Workspace Password</label>
+                    <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>Optional (leave blank for open LAN access)</span>
+                  </div>
                   <input
                     className="form-input"
                     type="password"
                     value={hostPassword}
                     onChange={(e) => setHostPassword(e.target.value)}
-                    required
+                    placeholder="Create a password or leave blank..."
                   />
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
@@ -1361,21 +1824,26 @@ export default function App() {
                       className="form-input"
                       value={hostName}
                       onChange={(e) => setHostName(e.target.value)}
+                      placeholder="e.g. Alice"
                       required
                     />
                   </div>
                   <div className="form-group">
-                    <label className="form-label">Server Port</label>
+                    <label className="form-label">Server Port (Dynamic Auto-bind)</label>
                     <input
                       className="form-input"
                       type="number"
                       value={hostPort}
                       onChange={(e) => setHostPort(e.target.value)}
+                      placeholder="7420 (Dynamic)"
                     />
                   </div>
                 </div>
-                <button type="submit" className="btn-primary" style={{ width: "100%", justifyContent: "center", marginTop: "10px" }}>
-                  <Server size={14} /> Start Server
+                <button type="submit" className="btn-primary btn-launch" style={{ width: "100%", marginTop: "12px" }}>
+                  <span className="btn-launch-icon-badge">
+                    <Play size={16} fill="currentColor" />
+                  </span>
+                  <span>Launch Workspace Server</span>
                 </button>
               </form>
             )}
@@ -1387,19 +1855,28 @@ export default function App() {
                   <input
                     className="form-input"
                     value={joinAddress}
-                    onChange={(e) => setJoinAddress(e.target.value)}
-                    placeholder="192.168.1.15:7420"
+                    onChange={(e) => {
+                      setJoinAddress(e.target.value);
+                      setJoinPasswordRequired(null);
+                    }}
+                    placeholder="e.g. 192.168.1.15:7420 or localhost:7420"
                     required
                   />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">Workspace Password</label>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                    <label className="form-label">Workspace Password</label>
+                    <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                      {joinPasswordRequired === false ? "No password needed" : joinPasswordRequired === true ? "Required by host" : "Optional / if required"}
+                    </span>
+                  </div>
                   <input
                     className="form-input"
                     type="password"
                     value={joinPassword}
                     onChange={(e) => setJoinPassword(e.target.value)}
-                    required
+                    placeholder={joinPasswordRequired === false ? "Not required" : "Enter password if set by host..."}
+                    disabled={joinPasswordRequired === false}
                   />
                 </div>
                 <div className="form-group">
@@ -1408,11 +1885,15 @@ export default function App() {
                     className="form-input"
                     value={joinUserName}
                     onChange={(e) => setJoinUserName(e.target.value)}
+                    placeholder="e.g. Bob"
                     required
                   />
                 </div>
-                <button type="submit" className="btn-primary" style={{ width: "100%", justifyContent: "center", marginTop: "10px" }}>
-                  Join Workspace
+                <button type="submit" className="btn-primary btn-launch" style={{ width: "100%", marginTop: "12px" }}>
+                  <span className="btn-launch-icon-badge">
+                    <ArrowRightCircle size={16} />
+                  </span>
+                  <span>Connect & Open Workspace</span>
                 </button>
               </form>
             )}
@@ -1434,12 +1915,14 @@ export default function App() {
                           <div style={{ fontWeight: 600 }}>{s.workspace_name}</div>
                           <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
                             Host: {s.host_name} • {s.ip}:{s.http_port}
+                            {s.password_required ? " • 🔒 Password protected" : " • 🔓 Open access"}
                           </div>
                         </div>
                         <button
                           className="btn-secondary"
                           onClick={() => {
                             setJoinAddress(`${s.ip}:${s.http_port}`);
+                            setJoinPasswordRequired(Boolean(s.password_required));
                             setActiveTab("join");
                           }}
                         >
@@ -1459,16 +1942,31 @@ export default function App() {
           {/* Workspace Toolbar */}
           <div className="workspace-toolbar">
             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-              <button className="btn-icon" onClick={goBack} disabled={historyIdx <= 0} title="Back (Alt+Left)">
+              <button
+                className={`btn-icon ${historyIdx > 0 ? "nav-btn-active" : ""}`}
+                onClick={goBack}
+                disabled={historyIdx <= 0}
+                title={historyIdx > 0 ? "Back (Alt+Left)" : "Back (no history)"}
+              >
                 <ArrowLeft size={14} />
               </button>
-              <button className="btn-icon" onClick={goForward} disabled={historyIdx >= history.length - 1} title="Forward (Alt+Right)">
+              <button
+                className={`btn-icon ${historyIdx < history.length - 1 ? "nav-btn-active" : ""}`}
+                onClick={goForward}
+                disabled={historyIdx >= history.length - 1}
+                title={historyIdx < history.length - 1 ? "Forward (Alt+Right)" : "Forward (no history)"}
+              >
                 <ArrowRight size={14} />
               </button>
-              <button className="btn-icon" onClick={goUp} disabled={!currentPath} title="Up one folder (Backspace)">
+              <button
+                className={`btn-icon ${Boolean(currentPath) ? "nav-btn-active" : ""}`}
+                onClick={goUp}
+                disabled={!currentPath}
+                title={Boolean(currentPath) ? "Up one folder (Backspace)" : "Root folder (cannot go up)"}
+              >
                 <ArrowUp size={14} />
               </button>
-              <button className="btn-icon" onClick={() => loadDirectory(currentPath)} title="Refresh">
+              <button className="btn-icon nav-btn-active" onClick={() => loadDirectory(currentPath)} title="Refresh">
                 <RefreshCw size={13} />
               </button>
 
@@ -1546,15 +2044,15 @@ export default function App() {
                     <thead>
                       <tr>
                         <th onClick={() => { setSortBy("name"); setSortAsc(!sortAsc); }}>Name</th>
-                        <th onClick={() => { setSortBy("type"); setSortAsc(!sortAsc); }}>Type</th>
-                        <th onClick={() => { setSortBy("size"); setSortAsc(!sortAsc); }}>Size</th>
-                        <th onClick={() => { setSortBy("modified"); setSortAsc(!sortAsc); }}>Modified</th>
+                        <th onClick={() => { setSortBy("type"); setSortAsc(!sortAsc); }} style={{ width: "80px" }}>Type</th>
+                        <th style={{ width: "110px" }}>Sync</th>
                       </tr>
                     </thead>
                     <tbody>
                       {filteredFiles.map((item) => {
                         const isSelected = selectedPaths.includes(item.path);
                         const isRenaming = renamingPath === item.path;
+                        const tracked = localTrackedFiles[item.path];
 
                         return (
                           <tr
@@ -1593,36 +2091,67 @@ export default function App() {
                           >
                             <td className="file-name-cell">
                               {item.is_dir ? (
-                                <Folder size={15} color="var(--text-secondary)" />
-                              ) : (
-                                <File size={15} color="var(--text-muted)" />
-                              )}
-                              {isRenaming ? (
-                                <input
-                                  autoFocus
-                                  className="inline-rename-input"
-                                  value={renameValue}
-                                  onChange={(e) => setRenameValue(e.target.value)}
-                                  onBlur={() => handleCommitRename(item.path, renameValue)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") handleCommitRename(item.path, renameValue);
-                                    if (e.key === "Escape") setRenamingPath(null);
+                                <span
+                                  className="folder-name-link"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    navigateTo(item.path);
                                   }}
-                                  onClick={(e) => e.stopPropagation()}
-                                />
+                                  title={`Open folder: ${item.name}`}
+                                  style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}
+                                >
+                                  <Folder size={15} color="var(--text-secondary)" />
+                                  <span>{item.name}</span>
+                                </span>
                               ) : (
-                                <span>{item.name}</span>
+                                <>
+                                  <File size={15} color="var(--text-muted)" />
+                                  {isRenaming ? (
+                                    <input
+                                      autoFocus
+                                      className="inline-rename-input"
+                                      value={renameValue}
+                                      onChange={(e) => setRenameValue(e.target.value)}
+                                      onBlur={() => handleCommitRename(item.path, renameValue)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter") handleCommitRename(item.path, renameValue);
+                                        if (e.key === "Escape") setRenamingPath(null);
+                                      }}
+                                      onClick={(e) => e.stopPropagation()}
+                                    />
+                                  ) : (
+                                    <span>{item.name}</span>
+                                  )}
+                                </>
                               )}
                             </td>
                             <td>{item.type}</td>
-                            <td>{item.is_dir ? "—" : formatBytes(item.size)}</td>
-                            <td>{formatDate(item.modified)}</td>
+                            <td>
+                              {tracked ? (
+                                <span
+                                  className={`badge-sync ${
+                                    tracked.sync_state === "SYNCED" ? "synced" :
+                                    tracked.sync_state === "LOCAL_MODIFIED" ? "local-modified" :
+                                    tracked.sync_state === "SERVER_UPDATED" ? "server-updated" :
+                                    tracked.sync_state === "CONFLICT" ? "conflict" : "missing"
+                                  }`}
+                                  title={`Local copy: ${tracked.local_path}\nServer v${tracked.server_version} | Base v${tracked.base_version}`}
+                                >
+                                  {tracked.sync_state === "SYNCED" ? "SYNCED" :
+                                   tracked.sync_state === "LOCAL_MODIFIED" ? "MODIFIED" :
+                                   tracked.sync_state === "SERVER_UPDATED" ? "UPDATED" :
+                                   tracked.sync_state === "CONFLICT" ? "CONFLICT" : tracked.sync_state}
+                                </span>
+                              ) : (
+                                <span style={{ color: "var(--text-muted)", fontSize: "11px" }}>—</span>
+                              )}
+                            </td>
                           </tr>
                         );
                       })}
                       {filteredFiles.length === 0 && (
                         <tr>
-                          <td colSpan="4" style={{ textAlign: "center", padding: "30px 10px", color: "var(--text-muted)" }}>
+                          <td colSpan="2" style={{ textAlign: "center", padding: "30px 10px", color: "var(--text-muted)" }}>
                             <div>This folder is empty.</div>
                             <div style={{ fontSize: "11px", marginTop: "4px" }}>Drop files here or click New Folder / Upload</div>
                           </td>
@@ -1649,7 +2178,8 @@ export default function App() {
                 </div>
                 <div className="panel-content" style={{ padding: "6px 8px" }}>
                   {connectedUsers.map((u) => {
-                    const isUserViewing = u.status === "viewing" && u.viewing_file;
+                    const isWriting = u.writing_files && u.writing_files.length > 0;
+                    const isReading = !isWriting && u.viewing_file;
                     return (
                       <div
                         key={u.client_id}
@@ -1663,15 +2193,42 @@ export default function App() {
                       >
                         <div>
                           <div style={{ display: "flex", alignItems: "center", gap: "6px", fontWeight: 500 }}>
-                            <span className={`status-dot ${u.status === "idle" ? "reconnecting" : "connected"}`} />
+                            <span className={`status-dot ${u.status === "idle" ? "reconnecting" : isWriting ? "connected" : "connected"}`} style={{ backgroundColor: isWriting ? "var(--status-amber)" : undefined }} />
                             <span>{u.user_name}</span>
+                            <span
+                              style={{
+                                fontFamily: "var(--font-mono)",
+                                fontSize: "10px",
+                                padding: "1px 5px",
+                                backgroundColor: "var(--bg-tertiary)",
+                                borderRadius: "3px",
+                                color: "var(--text-secondary)",
+                                border: "1px solid var(--border-light)"
+                              }}
+                              title={`Unique Client ID: ${u.client_id}`}
+                            >
+                              ID: {u.client_id}
+                            </span>
                             {u.is_host && <span className="brand-badge">HOST</span>}
+                            {u.client_id === session?.client_id && (
+                              <span style={{ fontSize: "10px", color: "var(--brand-primary)", fontWeight: 600 }}>(You)</span>
+                            )}
                           </div>
                           <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>
-                            {isUserViewing ? `Viewing: ${u.viewing_file}` : u.status === "idle" ? "Inactive" : "Browsing workspace"}
+                            {isWriting ? (
+                              <span style={{ color: "var(--status-amber)" }}>Writing {u.writing_files.join(", ")}</span>
+                            ) : isReading ? (
+                              <span>Reading {u.viewing_file}</span>
+                            ) : u.status === "idle" ? (
+                              "Inactive"
+                            ) : (
+                              "Browsing workspace"
+                            )}
                           </div>
                         </div>
-                        <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>Read-only</span>
+                        <span className={`badge-lock ${isWriting ? "locked" : "available"}`} style={{ fontSize: "10px", padding: "1px 5px" }}>
+                          {isWriting ? "Writer" : "Read-only"}
+                        </span>
                       </div>
                     );
                   })}
@@ -1816,8 +2373,8 @@ export default function App() {
                                   Cancel Request
                                 </button>
                               </>
-                            ) : (
-                              /* If available or locked by someone else */
+                            ) : !session?.is_host ? (
+                              /* If available or locked by someone else and user is a guest */
                               <button
                                 className="btn-secondary"
                                 style={{ padding: "3px 8px", fontSize: "11px" }}
@@ -1826,7 +2383,7 @@ export default function App() {
                                 <Lock size={11} />
                                 {fileMetadata.lock_state === "LOCKED" ? "Join Queue" : "Request Edit Access"}
                               </button>
-                            )}
+                            ) : null}
 
                             {/* Host Controls */}
                             {session?.is_host && (
@@ -1839,6 +2396,79 @@ export default function App() {
                                 <ListOrdered size={11} /> Queue
                               </button>
                             )}
+                          </div>
+                        </div>
+                      )}
+                      {/* Phase 4: Local Client Workspace Tracking Status Banner */}
+                      {!activeFile.is_dir && localTrackedFiles[activeFile.path] && (
+                        <div style={{ padding: "8px 14px", backgroundColor: "var(--bg-subtle)", borderBottom: "1px solid var(--border-light)", fontSize: "11px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px" }}>
+                          <div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                              <span style={{ fontWeight: 600 }}>Local Copy:</span>
+                              <span style={{ fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
+                                {localTrackedFiles[activeFile.path].local_path}
+                              </span>
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginTop: "2px", color: "var(--text-muted)" }}>
+                              <span>Status: <strong style={{ color: "var(--text-primary)" }}>{localTrackedFiles[activeFile.path].sync_state}</strong></span>
+                              <span>Base v{localTrackedFiles[activeFile.path].base_version}</span>
+                              <span>Server v{localTrackedFiles[activeFile.path].server_version}</span>
+                            </div>
+                          </div>
+
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                            {localTrackedFiles[activeFile.path].sync_state === "LOCAL_MODIFIED" && (
+                              fileMetadata?.writer?.client_id === session?.client_id ? (
+                                <button
+                                  className="btn-primary"
+                                  style={{ padding: "2px 8px", fontSize: "11px" }}
+                                  onClick={() => handleClientCommit(localTrackedFiles[activeFile.path])}
+                                  title="Commit local changes detected by watcher"
+                                >
+                                  <GitCommit size={11} /> Commit Local Changes
+                                </button>
+                              ) : (
+                                <button
+                                  className="btn-secondary"
+                                  style={{ padding: "2px 8px", fontSize: "11px" }}
+                                  onClick={() => handleRequestWriteAccess(activeFile)}
+                                  title="Request edit access to commit your changes"
+                                >
+                                  <Lock size={11} /> Request Edit Access
+                                </button>
+                              )
+                            )}
+
+                            {localTrackedFiles[activeFile.path].sync_state === "SERVER_UPDATED" && (
+                              <button
+                                className="btn-primary"
+                                style={{ padding: "2px 8px", fontSize: "11px" }}
+                                onClick={() => handleClientPull(localTrackedFiles[activeFile.path], false)}
+                                title="Update local copy with newer server version"
+                              >
+                                <RefreshCw size={11} /> Update Local Copy
+                              </button>
+                            )}
+
+                            {localTrackedFiles[activeFile.path].sync_state === "CONFLICT" && (
+                              <button
+                                className="btn-primary"
+                                style={{ padding: "2px 8px", fontSize: "11px", backgroundColor: "var(--status-red)", borderColor: "var(--status-red)" }}
+                                onClick={() => setModalConflictResolution(localTrackedFiles[activeFile.path])}
+                                title="Resolve conflict between local edits and server updates"
+                              >
+                                <AlertTriangle size={11} /> Resolve Conflict
+                              </button>
+                            )}
+
+                            <button
+                              className="btn-secondary"
+                              style={{ padding: "2px 6px", fontSize: "10px" }}
+                              onClick={() => handleStopTracking(localTrackedFiles[activeFile.path])}
+                              title="Stop watching this local copy"
+                            >
+                              Stop Tracking
+                            </button>
                           </div>
                         </div>
                       )}
@@ -1857,21 +2487,53 @@ export default function App() {
                           </div>
                         )}
                         {filePreview?.kind === "binary" && (
-                          <div className="inspector-empty">
-                            <AlertCircle size={28} />
-                            <div>Preview unavailable for binary file ({activeFile.name})</div>
-                            <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                              <button className="btn-secondary" onClick={() => handleOpenLocally(activeFile)}>
-                                Open Locally
-                              </button>
-                              <a
-                                href={`${serverUrl}/api/file/download?path=${encodeURIComponent(activeFile.path)}`}
-                                className="btn-secondary"
-                                style={{ textDecoration: "none" }}
-                              >
-                                Download
-                              </a>
-                            </div>
+                          <div style={{ padding: "16px", height: "100%", display: "flex", flexDirection: "column" }}>
+                            {filePreview.is_pickled ? (
+                              <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                                  <span style={{ fontWeight: 600, fontSize: "12px", color: "var(--brand-primary)", display: "flex", alignItems: "center", gap: "6px" }}>
+                                    <Activity size={14} /> Pickled Inspection ({filePreview.pickle_type || "Object"})
+                                  </span>
+                                  <button
+                                    className="btn-secondary"
+                                    style={{ fontSize: "11px", padding: "2px 8px" }}
+                                    onClick={() => handlePickleBinary(activeFile, false)}
+                                  >
+                                    Close Pickle View
+                                  </button>
+                                </div>
+                                <pre className="preview-code-block" style={{ flex: 1, margin: 0, overflow: "auto" }}>
+                                  {filePreview.pickle_repr || "Empty pickle representation"}
+                                </pre>
+                              </div>
+                            ) : (
+                              <div className="inspector-empty" style={{ flex: 1 }}>
+                                <AlertCircle size={28} />
+                                <div>Binary File ({activeFile.name})</div>
+                                <p style={{ fontSize: "12px", color: "var(--text-secondary)", maxWidth: "380px", margin: "6px 0 12px 0", textAlign: "center" }}>
+                                  This is a binary file. Would you like to pickle / deserialize it to inspect its Python object structure?
+                                </p>
+                                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", justifyContent: "center" }}>
+                                  <button
+                                    className="btn-primary"
+                                    onClick={() => handlePickleBinary(activeFile, true)}
+                                    style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
+                                  >
+                                    <Activity size={13} /> Pickle & Inspect Object
+                                  </button>
+                                  <button className="btn-secondary" onClick={() => handleOpenLocally(activeFile)}>
+                                    Open Locally
+                                  </button>
+                                  <a
+                                    href={`${serverUrl}/api/file/download?path=${encodeURIComponent(activeFile.path)}`}
+                                    className="btn-secondary"
+                                    style={{ textDecoration: "none" }}
+                                  >
+                                    Download
+                                  </a>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         )}
                         {!filePreview && (
@@ -2001,8 +2663,47 @@ export default function App() {
                   }}
                 >
                   <HardDrive size={14} />
-                  <span>Open Locally</span>
+                  <span>{localTrackedFiles[contextMenu.item.path] ? "Open Local Copy" : "Open Locally"}</span>
                 </div>
+              )}
+
+              {!contextMenu.item.is_dir && localTrackedFiles[contextMenu.item.path] && (
+                <>
+                  {localTrackedFiles[contextMenu.item.path].sync_state === "SERVER_UPDATED" && (
+                    <div
+                      className="context-item"
+                      onClick={() => {
+                        handleClientPull(localTrackedFiles[contextMenu.item.path], false);
+                        setContextMenu(null);
+                      }}
+                    >
+                      <RefreshCw size={14} />
+                      <span>Update Local Copy</span>
+                    </div>
+                  )}
+                  {localTrackedFiles[contextMenu.item.path].sync_state === "CONFLICT" && (
+                    <div
+                      className="context-item"
+                      onClick={() => {
+                        setModalConflictResolution(localTrackedFiles[contextMenu.item.path]);
+                        setContextMenu(null);
+                      }}
+                    >
+                      <AlertTriangle size={14} color="var(--status-red)" />
+                      <span style={{ color: "var(--status-red)" }}>Resolve Conflict</span>
+                    </div>
+                  )}
+                  <div
+                    className="context-item"
+                    onClick={() => {
+                      handleStopTracking(localTrackedFiles[contextMenu.item.path]);
+                      setContextMenu(null);
+                    }}
+                  >
+                    <X size={14} />
+                    <span>Stop Tracking</span>
+                  </div>
+                </>
               )}
 
               {!contextMenu.item.is_dir && (
@@ -2016,7 +2717,7 @@ export default function App() {
                   <span>Download</span>
                 </a>
               )}
-              {!contextMenu.item.is_dir && (
+              {!contextMenu.item.is_dir && !session?.is_host && (
                 <div
                   className="context-item"
                   onClick={() => {
@@ -2457,8 +3158,21 @@ export default function App() {
                   modalEditQueue.queue.map((req, idx) => (
                     <div key={req.request_id} className="queue-item">
                       <div>
-                        <div style={{ fontWeight: 500 }}>
-                          #{req.position} {req.user_name}
+                        <div style={{ fontWeight: 500, display: "flex", alignItems: "center", gap: "6px" }}>
+                          <span>#{req.position} {req.user_name}</span>
+                          <span
+                            style={{
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "9px",
+                              padding: "1px 4px",
+                              backgroundColor: "var(--bg-tertiary)",
+                              borderRadius: "3px",
+                              color: "var(--text-secondary)",
+                              border: "1px solid var(--border-light)"
+                            }}
+                          >
+                            ID: {req.client_id}
+                          </span>
                         </div>
                         <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
                           Requested at {formatTime(req.requested_at)} (base v{req.base_version})
@@ -2640,8 +3354,68 @@ export default function App() {
           </div>
         </div>
       )}
+      {/* Phase 4: Conflict Resolution Dialog */}
+      {modalConflictResolution && (
+        <div className="modal-overlay" onClick={() => setModalConflictResolution(null)}>
+          <div className="modal-window" style={{ width: "520px" }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span style={{ color: "var(--status-red)", display: "flex", alignItems: "center", gap: "6px" }}>
+                <AlertTriangle size={15} /> Conflict Detected — {modalConflictResolution.shared_path}
+              </span>
+              <button className="btn-icon" onClick={() => setModalConflictResolution(null)}>
+                <X size={14} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <div style={{ fontSize: "12px", color: "var(--text-secondary)", lineHeight: 1.5, marginBottom: "12px" }}>
+                This file has changed on the shared server (Server Version: <strong>v{modalConflictResolution.server_version}</strong>),
+                while your local copy also contains uncommitted modifications made by your external editor.
+              </div>
+              <div style={{ backgroundColor: "var(--bg-subtle)", padding: "10px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", fontSize: "11px", marginBottom: "16px" }}>
+                <div><strong>Local Path:</strong> {modalConflictResolution.local_path}</div>
+                <div><strong>Your Base Version:</strong> v{modalConflictResolution.base_version}</div>
+                <div><strong>Server Version:</strong> v{modalConflictResolution.server_version}</div>
+              </div>
+              <div style={{ fontSize: "12px", fontWeight: 600, marginBottom: "8px" }}>
+                How would you like to proceed?
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <button
+                  className="btn-secondary"
+                  style={{ justifyContent: "flex-start", padding: "8px 12px" }}
+                  onClick={() => {
+                    addToast("Keeping local modifications intact. You can commit when you have write access.", "info");
+                    setModalConflictResolution(null);
+                  }}
+                >
+                  <div>
+                    <div style={{ fontWeight: 600 }}>Keep Local Working Copy</div>
+                    <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>Preserve your editor edits. Server will not be overwritten and local file is untouched.</div>
+                  </div>
+                </button>
+                <button
+                  className="btn-primary"
+                  style={{ justifyContent: "flex-start", padding: "8px 12px", backgroundColor: "var(--status-amber)", borderColor: "var(--status-amber)", color: "#000" }}
+                  onClick={() => handleClientPull(modalConflictResolution, true)}
+                >
+                  <div>
+                    <div style={{ fontWeight: 600 }}>Use Server Version (Overwrite Local)</div>
+                    <div style={{ fontSize: "11px", color: "#333" }}>Download v{modalConflictResolution.server_version} from the server, discarding your local edits.</div>
+                  </div>
+                </button>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setModalConflictResolution(null)}>
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
+
 }
 
 // Helpers

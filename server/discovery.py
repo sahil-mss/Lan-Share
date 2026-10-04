@@ -17,22 +17,26 @@ class LANDiscovery:
         self.running = False
         self.broadcaster_thread: Optional[threading.Thread] = None
         self.listener_thread: Optional[threading.Thread] = None
+        self.broadcaster_sock: Optional[socket.socket] = None
+        self.listener_sock: Optional[socket.socket] = None
         self.discovered_servers: Dict[str, Dict[str, Any]] = {}
         self.on_server_discovered: Optional[Callable[[Dict[str, Any]], None]] = None
 
-    def start_broadcasting(self, workspace_name: str, host_name: str, http_port: int):
+    def start_broadcasting(self, workspace_name: str, host_name: str, http_port: int, password_required: bool = False):
         self.running = True
         
         def broadcast_loop():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.settimeout(1.0)
+            self.broadcaster_sock = sock
             
             payload = {
                 "magic": DISCOVERY_MAGIC,
                 "workspace_name": workspace_name,
                 "host_name": host_name,
                 "http_port": http_port,
+                "password_required": password_required,
                 "timestamp": time.time()
             }
             
@@ -42,8 +46,15 @@ class LANDiscovery:
                     sock.sendto(data, ("<broadcast>", self.port))
                 except Exception:
                     pass
-                time.sleep(2.5)
-            sock.close()
+                # Check running flag frequently instead of sleeping full 2.5s
+                for _ in range(25):
+                    if not self.running:
+                        break
+                    time.sleep(0.1)
+            try:
+                sock.close()
+            except Exception:
+                pass
 
         self.broadcaster_thread = threading.Thread(target=broadcast_loop, daemon=True)
         self.broadcaster_thread.start()
@@ -60,7 +71,8 @@ class LANDiscovery:
             except Exception:
                 return
 
-            sock.settimeout(2.0)
+            sock.settimeout(1.0)
+            self.listener_sock = sock
 
             while self.running:
                 try:
@@ -76,6 +88,7 @@ class LANDiscovery:
                             "address": f"http://{ip}:{obj.get('http_port')}",
                             "workspace_name": obj.get("workspace_name"),
                             "host_name": obj.get("host_name"),
+                            "password_required": bool(obj.get("password_required", False)),
                             "last_seen": time.time()
                         }
                         self.discovered_servers[server_key] = server_info
@@ -85,7 +98,10 @@ class LANDiscovery:
                     continue
                 except Exception:
                     continue
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
 
         self.listener_thread = threading.Thread(target=listen_loop, daemon=True)
         self.listener_thread.start()
@@ -103,3 +119,13 @@ class LANDiscovery:
 
     def stop(self):
         self.running = False
+        if self.broadcaster_sock:
+            try:
+                self.broadcaster_sock.close()
+            except Exception:
+                pass
+        if self.listener_sock:
+            try:
+                self.listener_sock.close()
+            except Exception:
+                pass

@@ -9,7 +9,7 @@ import shutil
 import mimetypes
 import hashlib
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 class PathSecurityError(Exception):
     """Raised when a path attempts to escape the designated shared workspace root."""
@@ -32,6 +32,7 @@ class FileSystemManager:
         self.root_path = Path(root_dir).resolve()
         if not self.root_path.exists() or not self.root_path.is_dir():
             raise ValueError(f"Root path does not exist or is not a directory: {root_dir}")
+        self._meta_cache: Dict[str, Tuple[float, int, Dict[str, Any]]] = {}
 
     def validate_name(self, name: str) -> None:
         """Validates that a single file or directory name is legal and safe."""
@@ -299,16 +300,25 @@ class FileSystemManager:
 
         stat = target.stat()
         is_dir = target.is_dir()
+        norm_key = str(target)
         
+        # Check cache validity
+        cached_entry = self._meta_cache.get(norm_key)
+        if cached_entry:
+            c_mtime, c_size, c_data = cached_entry
+            if c_mtime == stat.st_mtime and c_size == stat.st_size:
+                return dict(c_data)
+
         sha256_hash = None
         if not is_dir and stat.st_size <= 10 * 1024 * 1024:
             try:
+                # Fast chunked read up to 1MB or small files to keep UI snappy
                 with open(target, "rb") as f:
-                    sha256_hash = hashlib.sha256(f.read()).hexdigest()[:12]
+                    sha256_hash = hashlib.sha256(f.read(1024 * 1024)).hexdigest()[:12]
             except Exception:
                 pass
 
-        return {
+        result = {
             "name": target.name,
             "path": str(target.relative_to(self.root_path)).replace("\\", "/"),
             "is_dir": is_dir,
@@ -319,6 +329,8 @@ class FileSystemManager:
             "hash": sha256_hash,
             "extension": target.suffix.lower() if not is_dir else None
         }
+        self._meta_cache[norm_key] = (stat.st_mtime, stat.st_size, result)
+        return dict(result)
 
     def read_file_preview(self, rel_path: str, max_bytes: int = 500 * 1024) -> Dict[str, Any]:
         target = self.resolve_safe_path(rel_path)

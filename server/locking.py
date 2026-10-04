@@ -36,9 +36,11 @@ class CommitValidationError(Exception):
 class FileLockManager:
     """Server-authoritative file lock and version manager."""
 
-    def __init__(self, db_path: Path, fs_manager):
+    def __init__(self, db_path: Path, fs_manager, auto_grant: bool = False, lock_grace_period: float = 30.0):
         self.db_path = db_path
         self.fs = fs_manager
+        self.auto_grant = auto_grant
+        self.lock_grace_period = lock_grace_period
         self._lock = threading.RLock()
 
         # In-memory transient lock and queue structures
@@ -51,6 +53,7 @@ class FileLockManager:
         #   "base_version": int,
         #   "created_at": float,
         #   "last_seen": float,
+        #   "disconnected_at": Optional[float],
         #   "state": str
         # }
         self._active_locks: Dict[str, Dict[str, Any]] = {}
@@ -73,6 +76,8 @@ class FileLockManager:
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode = WAL;")
+            cursor.execute("PRAGMA synchronous = NORMAL;")
             # File versions table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS file_versions (
@@ -99,6 +104,7 @@ class FileLockManager:
                     timestamp REAL NOT NULL
                 )
             """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_commits_file_ts ON file_commits (file_path, timestamp DESC);")
             conn.commit()
 
     def normalize_path(self, rel_path: str) -> str:
@@ -204,8 +210,10 @@ class FileLockManager:
                 "queue_count": len(formatted_queue)
             }
 
-    def request_write_access(self, file_path: str, client_id: str, user_name: str, is_host: bool = False, auto_grant_if_available: bool = True) -> Tuple[bool, str, Dict[str, Any]]:
+    def request_write_access(self, file_path: str, client_id: str, user_name: str, is_host: bool = False, auto_grant_if_available: Optional[bool] = None) -> Tuple[bool, str, Dict[str, Any]]:
         """A user requests edit access to a file."""
+        if auto_grant_if_available is None:
+            auto_grant_if_available = self.auto_grant
         norm_path = self.normalize_path(file_path)
         with self._lock:
             target = self.fs.resolve_safe_path(norm_path)
@@ -215,10 +223,11 @@ class FileLockManager:
             ver_info = self.get_file_version_info(norm_path)
             current_ver = ver_info["current_version"]
 
-            # If already writer, return current lock
+            # If already writer, return current lock and clear disconnected status
             active_lock = self._active_locks.get(norm_path)
             if active_lock and active_lock["writer_client_id"] == client_id:
                 active_lock["last_seen"] = time.time()
+                active_lock["disconnected_at"] = None
                 return True, "ALREADY_OWNER", self.get_file_state(norm_path)
 
             queue = self._request_queues.setdefault(norm_path, [])
@@ -408,7 +417,8 @@ class FileLockManager:
         content_bytes: bytes,
         author: str,
         summary: Optional[str] = None,
-        release_lock_after: bool = True
+        release_lock_after: bool = False,
+        base_version: Optional[int] = None
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         Validates lock, base version, calculates hash, atomically writes file,
@@ -435,12 +445,15 @@ class FileLockManager:
             except Exception as e:
                 return False, f"COMMIT_REJECTED: Path security or filesystem error: {str(e)}", {}
 
-            # Mark state as COMMITTING
-            active_lock["state"] = STATE_COMMITTING
-
             # 3. Base version validation
             ver_info = self.get_file_version_info(norm_path)
             current_ver = ver_info["current_version"]
+            if base_version is not None and base_version != current_ver:
+                return False, f"COMMIT_REJECTED: Stale base version {base_version} (server is at {current_ver}).", {}
+
+            # Mark state as COMMITTING
+            active_lock["state"] = STATE_COMMITTING
+
             next_ver = current_ver + 1
 
             # 4. Server-side hash calculation
@@ -516,13 +529,14 @@ class FileLockManager:
 
             return True, "COMMIT_ACCEPTED", commit_result
 
-    def handle_client_disconnect(self, client_id: str) -> List[Tuple[str, Dict[str, Any]]]:
+    def handle_client_disconnect(self, client_id: str, immediate_release: bool = False) -> List[Tuple[str, Dict[str, Any]]]:
         """
         When a client disconnects, clean up their queue requests.
-        For active writer locks: mark lock as abandoned or release lock safely so files
-        aren't held permanently hostage.
+        For active writer locks: mark lock with disconnected_at timestamp for grace period
+        or release immediately if requested.
         """
         affected = []
+        now = time.time()
         with self._lock:
             # 1. Remove from all queues
             for file_path, queue in list(self._request_queues.items()):
@@ -531,12 +545,27 @@ class FileLockManager:
                     self._request_queues[file_path] = new_q
                     affected.append((file_path, self.get_file_state(file_path)))
 
-            # 2. Release active locks held by disconnected writer
+            # 2. Mark active lock with disconnected_at or release immediately
             for file_path, active_lock in list(self._active_locks.items()):
                 if active_lock["writer_client_id"] == client_id:
-                    self._active_locks.pop(file_path, None)
+                    if immediate_release or self.lock_grace_period <= 0:
+                        self._active_locks.pop(file_path, None)
+                    else:
+                        active_lock["disconnected_at"] = now
                     affected.append((file_path, self.get_file_state(file_path)))
 
+        return affected
+
+    def cleanup_expired_locks(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Checks for locks whose disconnected grace period has expired, and releases them."""
+        affected = []
+        now = time.time()
+        with self._lock:
+            for file_path, active_lock in list(self._active_locks.items()):
+                disc_at = active_lock.get("disconnected_at")
+                if disc_at is not None and (now - disc_at) >= self.lock_grace_period:
+                    self._active_locks.pop(file_path, None)
+                    affected.append((file_path, self.get_file_state(file_path)))
         return affected
 
     def get_commit_history(self, file_path: str, limit: int = 30) -> List[Dict[str, Any]]:

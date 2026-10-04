@@ -14,6 +14,8 @@ class ActivityLogger:
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode = WAL;")
+            cursor.execute("PRAGMA synchronous = NORMAL;")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS activity_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +46,8 @@ class ActivityLogger:
                     synced_at REAL NOT NULL
                 )
             """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log (timestamp DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_access_file_ts ON access_history (file_path, timestamp DESC);")
             conn.commit()
 
     def log_event(self, event_type: str, user_name: str, client_id: str, file_path: Optional[str] = None, details: Optional[str] = None) -> Dict[str, Any]:

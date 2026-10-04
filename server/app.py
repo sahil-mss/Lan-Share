@@ -3,6 +3,7 @@ Provides FastAPI REST API, WebSocket real-time access and presence tracking,
 secure file streaming/preview, and session token authentication.
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Query, UploadFile, File
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -11,6 +12,8 @@ import hashlib
 import secrets
 import socket
 import os
+import sys
+import subprocess
 import time
 from typing import Dict, List, Optional, Any
 
@@ -19,9 +22,25 @@ from server.logger import ActivityLogger
 from server.discovery import LANDiscovery
 from server.locking import FileLockManager
 
-from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="LANShare Server", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Clean shutdown of discovery threads and sockets on SIGINT / Ctrl+C / exit
+    if SERVER_STATE.get("discovery"):
+        try:
+            SERVER_STATE["discovery"].stop()
+        except Exception:
+            pass
+    for ws in list(ACTIVE_CONNECTIONS.keys()):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    ACTIVE_CONNECTIONS.clear()
+
+app = FastAPI(title="LANShare Server", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,14 +75,22 @@ SESSIONS: Dict[str, Dict[str, Any]] = {}
 # Active WebSockets: ws -> token
 ACTIVE_CONNECTIONS: Dict[WebSocket, str] = {}
 
+_CACHED_LOCAL_IP: Optional[str] = None
+
 def get_local_ip() -> str:
+    global _CACHED_LOCAL_IP
+    if _CACHED_LOCAL_IP is not None:
+        return _CACHED_LOCAL_IP
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
+        _CACHED_LOCAL_IP = ip
         return ip
     except Exception:
+        _CACHED_LOCAL_IP = "127.0.0.1"
         return "127.0.0.1"
 
 def hash_password(password: str) -> str:
@@ -83,13 +110,13 @@ def get_current_session(authorization: Optional[str] = Header(None)) -> Dict[str
 class HostStartRequest(BaseModel):
     workspace_name: str
     shared_root: str
-    password: str
+    password: Optional[str] = ""
     host_name: str
     port: int = 7420
 
 class JoinRequest(BaseModel):
     user_name: str
-    password: str
+    password: Optional[str] = ""
 
 class TrackCopyRequest(BaseModel):
     shared_path: str
@@ -150,7 +177,8 @@ class CommitRequest(BaseModel):
     lock_id: str
     content: str
     summary: Optional[str] = None
-    release_lock: bool = True
+    release_lock: bool = False
+    base_version: Optional[int] = None
 
 # Broadcast real-time updates
 async def broadcast_event(event_type: str, payload: Any):
@@ -167,14 +195,30 @@ async def broadcast_event(event_type: str, payload: Any):
 def get_connected_users_list() -> List[Dict[str, Any]]:
     users = []
     now = time.time()
+    lm: FileLockManager = SERVER_STATE.get("lock_manager")
+    active_locks = lm.get_all_active_locks() if lm else {}
     for token, s in SESSIONS.items():
         is_stale = (now - s.get("last_active", s["connected_at"])) > 45.0
+        # Check files written by this client
+        writing_files = [
+            p for p, lstate in active_locks.items()
+            if lstate.get("writer") and lstate["writer"]["client_id"] == s["client_id"]
+        ]
+        status_label = s.get("status", "connected")
+        if writing_files:
+            status_label = "writing"
+        elif s.get("viewing_file"):
+            status_label = "reading"
+        elif is_stale:
+            status_label = "idle"
+
         users.append({
             "client_id": s["client_id"],
             "user_name": s["user_name"],
             "is_host": s["is_host"],
             "viewing_file": s.get("viewing_file"),
-            "status": "idle" if is_stale else s.get("status", "connected"),
+            "writing_files": writing_files,
+            "status": status_label,
             "connected_at": s["connected_at"],
             "last_active": s.get("last_active", s["connected_at"])
         })
@@ -202,8 +246,102 @@ def get_server_status():
         "local_url": f"http://localhost:{SERVER_STATE['port']}",
         "network_url": f"http://{SERVER_STATE['host_ip']}:{SERVER_STATE['port']}",
         "online_users": len(SESSIONS),
+        "password_required": bool(SERVER_STATE["password_hash"]),
         "discovered_lan_workspaces": discovered
     }
+
+@app.post("/api/system/browse-folder")
+def browse_folder():
+    """Opens native OS folder picker dialog on the host machine to select a workspace directory."""
+    selected_path = ""
+    # Try tkinter first if available
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.focus_force()
+        selected_path = filedialog.askdirectory(title="Select Folder to Share via LANShare")
+        root.destroy()
+    except Exception:
+        selected_path = ""
+
+    # Fallback to PowerShell FolderBrowserDialog on Windows if tkinter didn't produce path
+    if not selected_path and sys.platform == "win32":
+        try:
+            ps_script = (
+                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
+                "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                "$dialog.Description = 'Select Workspace Folder to Share via LANShare'; "
+                "$dialog.ShowNewFolderButton = $true; "
+                "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+                "Write-Host $dialog.SelectedPath }"
+            )
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            out = res.stdout.strip()
+            if out and Path(out).is_dir():
+                selected_path = out
+        except Exception:
+            pass
+
+    if selected_path:
+        resolved = Path(selected_path).resolve()
+        # Scan immediate directory items for live preview
+        items_preview = []
+        try:
+            for entry in os.scandir(resolved):
+                if entry.name.startswith("."):
+                    continue
+                is_dir = entry.is_dir()
+                items_preview.append({
+                    "name": entry.name,
+                    "is_dir": is_dir,
+                    "type": "folder" if is_dir else Path(entry.name).suffix.lower() or "file"
+                })
+            items_preview.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+        except Exception:
+            items_preview = []
+
+        return {
+            "success": True,
+            "path": str(resolved),
+            "items": items_preview[:50],
+            "total_count": len(items_preview)
+        }
+    return {"success": False, "path": "", "items": [], "total_count": 0}
+
+@app.post("/api/system/inspect-folder")
+def inspect_folder(req: Dict[str, str]):
+    """Returns immediate directory preview of any folder path for the launcher screen."""
+    path_str = req.get("path", "").strip()
+    if not path_str:
+        return {"items": [], "exists": False, "total_count": 0}
+    p = Path(path_str).resolve()
+    if not p.exists() or not p.is_dir():
+        return {"items": [], "exists": False, "total_count": 0}
+
+    items = []
+    try:
+        for entry in os.scandir(p):
+            if entry.name.startswith("."):
+                continue
+            is_dir = entry.is_dir()
+            items.append({
+                "name": entry.name,
+                "is_dir": is_dir,
+                "type": "folder" if is_dir else Path(entry.name).suffix.lower() or "file"
+            })
+        items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+    except Exception:
+        items = []
+
+    return {"items": items[:50], "exists": True, "total_count": len(items)}
 
 @app.post("/api/host/start")
 async def start_host_server(req: HostStartRequest):
@@ -214,21 +352,29 @@ async def start_host_server(req: HostStartRequest):
     SERVER_STATE["workspace_name"] = req.workspace_name.strip() or "Shared Workspace"
     SERVER_STATE["shared_root"] = str(p)
     SERVER_STATE["host_name"] = req.host_name.strip() or "Host"
-    SERVER_STATE["password_hash"] = hash_password(req.password)
+    raw_pwd = (req.password or "").strip()
+    SERVER_STATE["password_hash"] = hash_password(raw_pwd) if raw_pwd else ""
     SERVER_STATE["port"] = req.port
     SERVER_STATE["host_ip"] = get_local_ip()
     SERVER_STATE["fs"] = FileSystemManager(str(p))
 
-    # Activity logger db placed inside root or user config
-    log_db = p / ".lanshare_activity.db"
-    SERVER_STATE["logger"] = ActivityLogger(log_db)
-    SERVER_STATE["lock_manager"] = FileLockManager(log_db, SERVER_STATE["fs"])
+    # Dedicated persistent metadata and activity database in .lanshare/
+    dot_lanshare = p / ".lanshare"
+    dot_lanshare.mkdir(parents=True, exist_ok=True)
+    db_path = dot_lanshare / "lanshare.db"
+    SERVER_STATE["logger"] = ActivityLogger(db_path)
+    SERVER_STATE["lock_manager"] = FileLockManager(db_path, SERVER_STATE["fs"], auto_grant=True)
 
     # Start LAN discovery
     if SERVER_STATE["discovery"]:
         SERVER_STATE["discovery"].stop()
     disc = LANDiscovery()
-    disc.start_broadcasting(SERVER_STATE["workspace_name"], SERVER_STATE["host_name"], req.port)
+    disc.start_broadcasting(
+        SERVER_STATE["workspace_name"],
+        SERVER_STATE["host_name"],
+        req.port,
+        password_required=bool(SERVER_STATE["password_hash"])
+    )
     disc.start_listening()
     SERVER_STATE["discovery"] = disc
 
@@ -279,10 +425,13 @@ async def join_workspace(req: JoinRequest):
     if not SERVER_STATE["is_running"]:
         raise HTTPException(status_code=400, detail="No workspace is currently hosted on this server.")
 
-    if hash_password(req.password) != SERVER_STATE["password_hash"]:
-        if SERVER_STATE["logger"]:
-            SERVER_STATE["logger"].log_event("AUTH_FAILURE", req.user_name, "unknown", details="Invalid password attempt")
-        raise HTTPException(status_code=401, detail="Incorrect workspace password.")
+    expected_hash = SERVER_STATE.get("password_hash", "")
+    if expected_hash:
+        user_pwd = (req.password or "").strip()
+        if not user_pwd or hash_password(user_pwd) != expected_hash:
+            if SERVER_STATE["logger"]:
+                SERVER_STATE["logger"].log_event("AUTH_FAILURE", req.user_name, "unknown", details="Invalid password attempt")
+            raise HTTPException(status_code=401, detail="Incorrect workspace password.")
 
     base_name = req.user_name.strip() or "Guest"
     existing_names = {s["user_name"] for s in SESSIONS.values()}
@@ -326,7 +475,7 @@ async def leave_workspace(session: Dict[str, Any] = Depends(get_current_session)
 
     lm: FileLockManager = SERVER_STATE["lock_manager"]
     if lm:
-        affected = lm.handle_client_disconnect(session["client_id"])
+        affected = lm.handle_client_disconnect(session["client_id"], immediate_release=True)
         for file_path, updated_state in affected:
             await broadcast_event("LOCK_STATE_CHANGED", {"file_path": file_path, "state": updated_state, "action": "CLIENT_DISCONNECTED"})
 
@@ -375,6 +524,9 @@ def get_metadata(path: str, session: Dict[str, Any] = Depends(get_current_sessio
             meta["queue"] = file_state["queue"]
             meta["queue_count"] = file_state["queue_count"]
             meta["last_author"] = file_state["last_author"]
+            if file_state.get("last_hash"):
+                meta["hash"] = file_state["last_hash"]
+                meta["content_hash"] = file_state["last_hash"]
         else:
             meta["lock_state"] = "AVAILABLE"
             meta["version"] = 1
@@ -390,7 +542,11 @@ def get_metadata(path: str, session: Dict[str, Any] = Depends(get_current_sessio
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/file/preview")
-async def preview_file(path: str, session: Dict[str, Any] = Depends(get_current_session)):
+async def preview_file(
+    path: str,
+    pickle_inspect: bool = Query(False, alias="pickle"),
+    session: Dict[str, Any] = Depends(get_current_session)
+):
     fs: FileSystemManager = SERVER_STATE["fs"]
     if not fs:
         raise HTTPException(status_code=503, detail="Workspace filesystem not initialized.")
@@ -403,6 +559,34 @@ async def preview_file(path: str, session: Dict[str, Any] = Depends(get_current_
             SERVER_STATE["logger"].log_event("FILE_PREVIEWED", session["user_name"], session["client_id"], file_path=path)
 
         preview = fs.read_file_preview(path)
+
+        # If user explicitly requests to pickle / unpickle binary file
+        if pickle_inspect and preview.get("kind") == "binary":
+            target = fs.resolve_safe_path(path)
+            try:
+                import pickle
+                with open(target, "rb") as f:
+                    raw_bytes = f.read(2 * 1024 * 1024) # up to 2MB
+                
+                # Check if it's already a pickled file, or pickle the raw binary payload
+                unpickled_obj = None
+                try:
+                    unpickled_obj = pickle.loads(raw_bytes)
+                    preview["pickle_mode"] = "unpickled_stream"
+                    preview["pickle_repr"] = str(unpickled_obj)
+                    preview["pickle_type"] = type(unpickled_obj).__name__
+                except Exception:
+                    # Pickle the raw bytes data
+                    pickled_dump = pickle.dumps(raw_bytes)
+                    preview["pickle_mode"] = "pickled_binary"
+                    preview["pickle_repr"] = f"<bytes object of {len(raw_bytes)} bytes serialized with pickle protocol {pickle.HIGHEST_PROTOCOL}>\nHex preview:\n" + raw_bytes[:1024].hex(" ", 2)
+                    preview["pickle_type"] = "bytes"
+                    preview["pickled_size"] = len(pickled_dump)
+
+                preview["is_pickled"] = True
+            except Exception as pe:
+                preview["pickle_error"] = str(pe)
+
         await broadcast_event("USERS_UPDATE", get_connected_users_list())
         return preview
     except PathSecurityError as e:
@@ -834,7 +1018,8 @@ async def commit_file_changes(req: CommitRequest, session: Dict[str, Any] = Depe
             content_bytes=content_bytes,
             author=session["user_name"],
             summary=req.summary,
-            release_lock_after=req.release_lock
+            release_lock_after=req.release_lock,
+            base_version=req.base_version
         )
 
         if not success:
@@ -942,8 +1127,13 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         ACTIVE_CONNECTIONS.pop(websocket, None)
         if token and token in SESSIONS:
-            # We don't necessarily destroy session immediately on reload, but clear viewing
-            SESSIONS[token]["viewing_file"] = None
+            sess = SESSIONS[token]
+            sess["viewing_file"] = None
+            lm: FileLockManager = SERVER_STATE["lock_manager"]
+            if lm:
+                affected = lm.handle_client_disconnect(sess["client_id"], immediate_release=False)
+                for file_path, updated_state in affected:
+                    await broadcast_event("LOCK_STATE_CHANGED", {"file_path": file_path, "state": updated_state, "action": "CLIENT_DISCONNECTED"})
             await broadcast_event("USERS_UPDATE", get_connected_users_list())
     except Exception:
         ACTIVE_CONNECTIONS.pop(websocket, None)

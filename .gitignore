@@ -3,11 +3,10 @@ __pycache__/
 *.pyc
 node_modules/
 dist/
+.lanshare/
 .lanshare_activity.db*
+*.db
+*.db-wal
+*.db-shm
 .DS_Store
-temp_test_workspace/
-temp_crud_test_ws/
-temp_phase2b_test_ws/
-temp_multiclient_test_ws/
-temp_phase3_test_ws/
-
+temp_*

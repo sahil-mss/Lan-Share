@@ -202,10 +202,25 @@ input, button, select, textarea {
   justify-content: center;
   transition: all 0.15s ease;
 }
-.btn-icon:hover {
+.btn-icon:hover:not(:disabled) {
   background-color: var(--bg-hover);
   color: var(--text-primary);
   border-color: var(--border-light);
+}
+.btn-icon:disabled {
+  opacity: 0.35;
+  color: var(--text-muted);
+  cursor: not-allowed;
+  pointer-events: none;
+  background: transparent !important;
+  border-color: transparent !important;
+}
+.nav-btn-active {
+  color: var(--brand-primary) !important;
+}
+.nav-btn-active:hover {
+  background-color: var(--bg-hover) !important;
+  color: var(--brand-primary) !important;
 }
 
 .btn-secondary {
@@ -247,6 +262,35 @@ input, button, select, textarea {
   cursor: not-allowed;
 }
 
+.btn-launch {
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  letter-spacing: 0.2px;
+  border-radius: var(--radius-md);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+  transition: all 0.15s ease;
+}
+.btn-launch:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 8px rgba(0,0,0,0.16);
+}
+.btn-launch:active:not(:disabled) {
+  transform: translateY(0);
+}
+.btn-launch-icon-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: var(--radius-sm);
+  padding: 4px;
+}
+
 /* Launcher View */
 .launcher-screen {
   flex: 1;
@@ -270,6 +314,26 @@ input, button, select, textarea {
   margin-bottom: 20px;
   border-bottom: 1px solid var(--border-light);
   padding-bottom: 14px;
+}
+
+.launcher-header-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.launcher-app-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-md);
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border-medium);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-primary);
+  box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+  flex-shrink: 0;
 }
 
 .launcher-title {
@@ -550,6 +614,16 @@ input, button, select, textarea {
   gap: 8px;
 }
 
+.folder-name-link {
+  font-weight: 500;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: color 0.1s ease;
+}
+.folder-name-link:hover {
+  text-decoration: underline;
+}
+
 /* Inline Rename Input */
 .inline-rename-input {
   padding: 2px 6px;
@@ -799,4 +873,49 @@ input, button, select, textarea {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* Phase 4: Local Client Sync Badges */
+.badge-sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-light);
+  letter-spacing: 0.3px;
+  font-family: var(--font-mono);
+}
+
+.badge-sync.synced {
+  background-color: var(--bg-subtle);
+  color: var(--status-green);
+  border-color: rgba(46, 160, 67, 0.25);
+}
+
+.badge-sync.local-modified {
+  background-color: var(--bg-subtle);
+  color: var(--status-amber);
+  border-color: rgba(210, 153, 34, 0.3);
+}
+
+.badge-sync.server-updated {
+  background-color: var(--bg-subtle);
+  color: var(--text-primary);
+  border-color: var(--border-medium);
+}
+
+.badge-sync.conflict {
+  background-color: var(--bg-subtle);
+  color: var(--status-red);
+  border-color: rgba(207, 34, 46, 0.3);
+}
+
+.badge-sync.missing {
+  background-color: var(--bg-subtle);
+  color: var(--text-muted);
+  border-style: dashed;
+}
+
 
