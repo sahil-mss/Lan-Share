@@ -180,13 +180,35 @@ def get_notifications(clear: bool = False, _=Depends(verify_local_auth)):
         CLIENT_NOTIFICATIONS = []
     return {"events": events}
 
+import socket
+
+def find_available_client_port(start_port: int = 7430, max_attempts: int = 50) -> int:
+    """Finds start_port or the next available localhost port."""
+    for p in range(start_port, start_port + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
 def run_client(port: int = 7430):
-    client_config.local_port = port
-    print(f"[LANShare Client] Starting local sync daemon on http://127.0.0.1:{port}")
+    actual_port = find_available_client_port(port)
+    client_config.local_port = actual_port
+    client_config._save()
+    if actual_port != port:
+        print(f"[LANShare Client] Requested port {port} is busy. Dynamically bound to http://127.0.0.1:{actual_port}")
+    else:
+        print(f"[LANShare Client] Starting local sync daemon on http://127.0.0.1:{actual_port}")
     print(f"[LANShare Client] Client ID: {client_config.client_id}")
     print(f"[LANShare Client] Local Token: {client_config.client_token}")
     try:
-        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+        uvicorn.run(app, host="127.0.0.1", port=actual_port, log_level="info")
     finally:
         sync_engine.stop()
 
@@ -195,3 +217,4 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=7430, help="Local client port")
     args = parser.parse_args()
     run_client(args.port)
+

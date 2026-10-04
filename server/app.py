@@ -77,21 +77,48 @@ ACTIVE_CONNECTIONS: Dict[WebSocket, str] = {}
 
 _CACHED_LOCAL_IP: Optional[str] = None
 
-def get_local_ip() -> str:
-    global _CACHED_LOCAL_IP
-    if _CACHED_LOCAL_IP is not None:
-        return _CACHED_LOCAL_IP
+def get_all_lan_ips() -> List[str]:
+    """Finds all non-loopback, non-link-local IPv4 addresses across network adapters."""
+    ips: List[str] = []
+    # 1. Primary outbound socket route probe
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
+        primary_ip = s.getsockname()[0]
         s.close()
-        _CACHED_LOCAL_IP = ip
-        return ip
+        if not primary_ip.startswith("127.") and not primary_ip.startswith("169.254."):
+            ips.append(primary_ip)
     except Exception:
-        _CACHED_LOCAL_IP = "127.0.0.1"
-        return "127.0.0.1"
+        pass
+
+    # 2. Hostname address enumeration
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            candidate = info[4][0]
+            if ":" not in candidate and not candidate.startswith("127.") and not candidate.startswith("169.254."):
+                if candidate not in ips:
+                    ips.append(candidate)
+    except Exception:
+        pass
+
+    return ips
+
+def get_local_ip() -> str:
+    """Returns the primary routable LAN IPv4 address, never 127.0.0.1 or 0.0.0.0 unless no NIC exists."""
+    global _CACHED_LOCAL_IP
+    if _CACHED_LOCAL_IP is not None and not _CACHED_LOCAL_IP.startswith("127.") and not _CACHED_LOCAL_IP.startswith("169.254."):
+        return _CACHED_LOCAL_IP
+
+    all_ips = get_all_lan_ips()
+    if all_ips:
+        _CACHED_LOCAL_IP = all_ips[0]
+        return all_ips[0]
+
+    _CACHED_LOCAL_IP = "127.0.0.1"
+    return "127.0.0.1"
+
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -237,6 +264,7 @@ def serve_index():
 def get_server_status():
     discovery = SERVER_STATE["discovery"]
     discovered = discovery.get_active_servers() if discovery else []
+    all_ips = get_all_lan_ips()
     return {
         "is_running": SERVER_STATE["is_running"],
         "workspace_name": SERVER_STATE["workspace_name"],
@@ -245,6 +273,7 @@ def get_server_status():
         "host_ip": SERVER_STATE["host_ip"],
         "local_url": f"http://localhost:{SERVER_STATE['port']}",
         "network_url": f"http://{SERVER_STATE['host_ip']}:{SERVER_STATE['port']}",
+        "network_ips": all_ips,
         "online_users": len(SESSIONS),
         "password_required": bool(SERVER_STATE["password_hash"]),
         "discovered_lan_workspaces": discovered
@@ -343,6 +372,53 @@ def inspect_folder(req: Dict[str, str]):
 
     return {"items": items[:50], "exists": True, "total_count": len(items)}
 
+_CLIENT_SUBPROCESS: Optional[subprocess.Popen] = None
+
+@app.post("/api/system/start-client")
+def start_local_client_daemon():
+    """Starts the local client daemon in the background if not already running."""
+    global _CLIENT_SUBPROCESS
+    # Check if already accessible
+    try:
+        req = urllib.request.Request("http://127.0.0.1:7430/status", method="GET")
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            if resp.status == 200:
+                return {"success": True, "message": "Local client is already running.", "status": "ONLINE"}
+    except Exception:
+        pass
+
+    # Launch client process
+    try:
+        client_script = Path(__file__).parent.parent / "client" / "main.py"
+        py_exe = sys.executable
+        proc = subprocess.Popen(
+            [py_exe, str(client_script), "--port", "7430"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).parent.parent)
+        )
+        _CLIENT_SUBPROCESS = proc
+        return {"success": True, "message": "Started local client daemon.", "status": "LAUNCHING"}
+    except Exception as e:
+        return {"success": False, "message": f"Could not launch local client: {str(e)}", "status": "FAILED"}
+
+@app.get("/api/system/firewall-check")
+def check_firewall_status():
+    """Detects whether Windows Firewall might be blocking incoming LAN traffic."""
+    all_ips = get_all_lan_ips()
+    has_lan = len(all_ips) > 0
+    return {
+        "is_windows": sys.platform == "win32",
+        "has_lan_interfaces": has_lan,
+        "primary_lan_ip": all_ips[0] if has_lan else "127.0.0.1",
+        "all_ips": all_ips,
+        "notice": (
+            "If devices on your local network cannot connect, ensure Windows Firewall "
+            "permits incoming connections for Python / LANShare on your private network profile."
+        )
+    }
+
+
 @app.post("/api/host/start")
 async def start_host_server(req: HostStartRequest):
     p = Path(req.shared_root).resolve()
@@ -369,11 +445,13 @@ async def start_host_server(req: HostStartRequest):
     if SERVER_STATE["discovery"]:
         SERVER_STATE["discovery"].stop()
     disc = LANDiscovery()
+    server_id = f"{SERVER_STATE['host_name']}_{SERVER_STATE['workspace_name']}_{req.port}"
     disc.start_broadcasting(
         SERVER_STATE["workspace_name"],
         SERVER_STATE["host_name"],
         req.port,
-        password_required=bool(SERVER_STATE["password_hash"])
+        password_required=bool(SERVER_STATE["password_hash"]),
+        server_id=server_id
     )
     disc.start_listening()
     SERVER_STATE["discovery"] = disc

@@ -12,6 +12,9 @@ import socket
 import asyncio
 import logging
 import copy
+import subprocess
+import threading
+
 
 class FriendlyUrlFilter(logging.Filter):
     """Replaces non-clickable 0.0.0.0 in Uvicorn startup banner with valid http://localhost:port."""
@@ -52,6 +55,9 @@ def run():
     parser.add_argument("--password", default=None, help="Password for auto-hosted folder")
     parser.add_argument("--name", default="Shared Workspace", help="Workspace Name")
     parser.add_argument("--hostname", default="Host", help="Host Display Name")
+    parser.add_argument("--browser", action="store_true", default=True, help="Automatically open browser on launch")
+    parser.add_argument("--no-browser", dest="browser", action="store_false", help="Do not open browser")
+    parser.add_argument("--start-client", action="store_true", default=False, help="Also start Local Client daemon in background")
 
     args = parser.parse_args()
 
@@ -73,6 +79,24 @@ def run():
             )
             await start_host_server(req)
         asyncio.run(init())
+
+    # Optional Local Client startup
+    if args.start_client:
+        try:
+            client_script = Path(__file__).parent / "client" / "main.py"
+            subprocess.Popen([sys.executable, str(client_script), "--port", "7430"])
+            print("[LANShare] Started Local Client daemon on http://127.0.0.1:7430")
+        except Exception as e:
+            print(f"[LANShare] Note: Could not auto-start local client daemon: {e}")
+
+    # Auto-open browser in background thread
+    if args.browser:
+        def open_browser():
+            import time
+            import webbrowser
+            time.sleep(1.0)
+            webbrowser.open(f"http://localhost:{actual_port}")
+        threading.Thread(target=open_browser, daemon=True).start()
 
     log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
     log_config["filters"] = {

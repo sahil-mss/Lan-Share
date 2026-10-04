@@ -22,8 +22,9 @@ class LANDiscovery:
         self.discovered_servers: Dict[str, Dict[str, Any]] = {}
         self.on_server_discovered: Optional[Callable[[Dict[str, Any]], None]] = None
 
-    def start_broadcasting(self, workspace_name: str, host_name: str, http_port: int, password_required: bool = False):
+    def start_broadcasting(self, workspace_name: str, host_name: str, http_port: int, password_required: bool = False, server_id: Optional[str] = None):
         self.running = True
+        sid = server_id or f"{host_name}_{http_port}"
         
         def broadcast_loop():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -33,6 +34,7 @@ class LANDiscovery:
             
             payload = {
                 "magic": DISCOVERY_MAGIC,
+                "server_id": sid,
                 "workspace_name": workspace_name,
                 "host_name": host_name,
                 "http_port": http_port,
@@ -80,9 +82,10 @@ class LANDiscovery:
                     ip = addr[0]
                     obj = json.loads(data.decode("utf-8"))
                     if obj.get("magic") == DISCOVERY_MAGIC:
-                        server_key = f"{ip}:{obj.get('http_port')}"
+                        sid = obj.get("server_id") or f"{ip}:{obj.get('http_port')}"
                         server_info = {
-                            "key": server_key,
+                            "key": sid,
+                            "server_id": sid,
                             "ip": ip,
                             "http_port": obj.get("http_port"),
                             "address": f"http://{ip}:{obj.get('http_port')}",
@@ -91,7 +94,7 @@ class LANDiscovery:
                             "password_required": bool(obj.get("password_required", False)),
                             "last_seen": time.time()
                         }
-                        self.discovered_servers[server_key] = server_info
+                        self.discovered_servers[sid] = server_info
                         if self.on_server_discovered:
                             self.on_server_discovered(server_info)
                 except socket.timeout:

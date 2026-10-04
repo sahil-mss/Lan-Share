@@ -207,6 +207,33 @@ export default function App() {
     }
   }, [theme]);
 
+  // Phase 5: Server Status & Discovered LAN Workspaces Polling on Launcher
+  useEffect(() => {
+    if (session) return;
+    let active = true;
+
+    const pollDiscovery = async () => {
+      try {
+        const res = await fetch(`${serverUrl}/api/status`);
+        if (res.ok) {
+          const data = await res.json();
+          if (active) {
+            if (data.discovered_lan_workspaces) {
+              setDiscoveredServers(data.discovered_lan_workspaces);
+            }
+          }
+        }
+      } catch (err) {}
+    };
+
+    pollDiscovery();
+    const interval = setInterval(pollDiscovery, 2500);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [session, serverUrl]);
+
   // Phase 4: Periodic Local Client discovery and tracking state poll
   useEffect(() => {
     let active = true;
@@ -247,6 +274,7 @@ export default function App() {
       clearInterval(interval);
     };
   }, [session, serverUrl]);
+
 
 
   // Load files for directory with in-flight cancellation and path validation
@@ -1657,9 +1685,40 @@ export default function App() {
                 <div className="launcher-app-icon" title="LANShare Application">
                   <HardDrive size={22} strokeWidth={2.2} />
                 </div>
-                <div>
+                <div style={{ flex: 1 }}>
                   <h1 className="launcher-title">LANShare Workspace</h1>
                   <p className="launcher-subtitle">Share folders securely across your local network without cloud storage.</p>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  {localClientStatus ? (
+                    <div className="status-pill" title={`Local sync client active on port ${localClientStatus.local_port || 7430}`}>
+                      <span className="status-dot connected" />
+                      <span>Local Client Ready</span>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                      <div className="status-pill" title="Local sync client not detected. Run python client/main.py or click start.">
+                        <span className="status-dot disconnected" />
+                        <span>Local Client Offline</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        style={{ fontSize: "11px", padding: "2px 8px" }}
+                        onClick={async () => {
+                          try {
+                            const res = await fetch(`${serverUrl}/api/system/start-client`, { method: "POST" });
+                            const d = await res.json();
+                            addToast(d.message || "Starting local client...", "info");
+                          } catch (e) {
+                            addToast("Start local client: python client/main.py", "info");
+                          }
+                        }}
+                      >
+                        Start Client
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -2899,11 +2958,37 @@ export default function App() {
                 <span style={{ color: "var(--text-muted)" }}>Local Address:</span>
                 <span>{serverUrl}</span>
 
+                <span style={{ color: "var(--text-muted)" }}>Network LAN Address:</span>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600 }}>
+                    {workspaceInfo?.network_url || serverUrl}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: "1px 6px", fontSize: "10px" }}
+                    onClick={() => {
+                      const netUrl = workspaceInfo?.network_url || serverUrl;
+                      navigator.clipboard.writeText(netUrl);
+                      addToast(`Copied LAN Address: ${netUrl}`, "info");
+                    }}
+                  >
+                    Copy Address
+                  </button>
+                </div>
+
+                <span style={{ color: "var(--text-muted)" }}>Access Protection:</span>
+                <span>{hostPassword ? "Password Protected" : "Open Access (No Password)"}</span>
+
                 <span style={{ color: "var(--text-muted)" }}>Connected Users:</span>
                 <span>{connectedUsers.length}</span>
 
                 <span style={{ color: "var(--text-muted)" }}>UDP Discovery:</span>
                 <span>Port 7421 (Active)</span>
+              </div>
+
+              <div style={{ padding: "8px 10px", backgroundColor: "var(--bg-subtle)", border: "1px solid var(--border-light)", borderRadius: "var(--radius-sm)", fontSize: "11px", color: "var(--text-secondary)", marginBottom: "14px" }}>
+                <strong>Tip for LAN Sharing:</strong> If devices on your Wi-Fi cannot connect, make sure Windows Firewall allows Python / LANShare on your Private network.
               </div>
 
               <button

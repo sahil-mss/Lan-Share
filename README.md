@@ -209,7 +209,7 @@ The compiled distribution in `frontend/dist` is automatically served directly by
 
 ### 5. Running Tests
 
-Run the comprehensive test suite to verify security, locking, and multi-client collaboration:
+Run the comprehensive test suite to verify security, locking, multi-client collaboration, and LAN discovery:
 
 ```bash
 # Security & path jail sandbox tests
@@ -217,11 +217,84 @@ venv\Scripts\python.exe tests\test_security.py
 
 # Multi-client and collaboration tests
 venv\Scripts\python.exe tests\test_crud_e2e.py
+venv\Scripts\python.exe tests\test_audit_e2e.py
+venv\Scripts\python.exe tests\test_reliability_phase2b.py
+venv\Scripts\python.exe tests\test_multiclient_e2e.py
 venv\Scripts\python.exe tests\test_locking_e2e.py
 venv\Scripts\python.exe tests\test_phase3_collaboration.py
 
 # Phase 4 Local Client Unit & E2E Integration tests
 venv\Scripts\python.exe tests\test_phase4_client.py
 venv\Scripts\python.exe tests\test_phase4_e2e.py
+
+# Phase 5 LAN Discovery, Multi-Server, and Production Packaging tests
+venv\Scripts\python.exe tests\test_phase5_lan.py
 ```
+
+---
+
+## Phase 5: Production Packaging, LAN Discovery & Real-World Validation
+
+Phase 5 packages LANShare into a desktop application with one-click launch, robust multi-adapter LAN discovery, automatic Local Client daemon management, and clear network address controls.
+
+### End-User Guide
+
+#### 1. One-Click Launch (`LANShare.bat`)
+Double-click `LANShare.bat` from the application folder.
+This automatically:
+1. Detects Python and the environment.
+2. Checks port availability (`7420` for server, `7430` for Local Client) and handles busy ports cleanly.
+3. Starts the Local Client background daemon.
+4. Launches the LANShare host engine.
+5. Automatically opens your default web browser to `http://localhost:7420`.
+
+#### 2. Hosting a Folder
+1. On the launcher screen, select **Host Server**.
+2. Pick or paste the local folder path (e.g. `D:\Projects\Demo`).
+3. Enter a Workspace Name and a secure password.
+4. Click **Launch Workspace Server**.
+5. The workspace opens in your browser.
+6. Click **Host Controls** at any time to inspect your physical LAN address (e.g., `http://192.168.1.42:7420`) and copy it for your teammates.
+
+#### 3. Joining a Shared Folder
+1. Ensure your device is connected to the same Wi-Fi or LAN.
+2. Open LANShare.
+3. Discovered workspaces appear under **LAN Workspaces** automatically via background UDP subnet announcements.
+4. Click **Select**, enter the workspace password, and click **Connect & Open Workspace**.
+5. If UDP discovery is restricted on your router or network, click **Enter Address Manually** (under Join Server) and enter the host's `IP:PORT`.
+
+#### 4. Using "Open Locally" & External Editors (VS Code, Cursor, etc.)
+1. Navigate to the desired file in the file list.
+2. Click **Open Locally**.
+3. LANShare downloads the file to your local workspace staging area and registers it with the Local Client watcher daemon.
+4. Open the file in your preferred editor (VS Code, Cursor, PyCharm, Sublime).
+5. Edit and save the file. The status changes to `LOCAL_MODIFIED` in LANShare.
+6. Request edit access (write lock) and click **Commit Changes** to sync back to the server.
+
+#### 5. Stopping the Server
+When done, click **Host Controls** > **Stop Server**. Any connected peers receive an immediate graceful disconnect notice, and locks are safely cleared without data loss.
+
+---
+
+### Network Architecture & LAN Discovery Details
+
+- **UDP Broadcast Port**: `7422` (Broadcast target: `255.255.255.255:7422`).
+- **Broadcast Safety Guarantee**: Discovery packets contain **zero secrets**:
+  - `workspace_name` (e.g., "Team Project")
+  - `host_name` (e.g., "Sahil-PC")
+  - `server_id` (composite non-colliding key: `<host>_<workspace>_<port>`)
+  - `port` (e.g., 7420)
+  - `version` (e.g., "1.0")
+  - **NEVER** broadcasted: passwords, password hashes, auth tokens, file names, or host filesystem paths.
+- **Multi-Adapter IPv4 Resolution**: LANShare dynamically filters out virtual loopbacks (`127.0.0.1`), link-local auto-configuration IPs (`169.254.x.x`), and Docker/Hyper-V virtual adapters to announce genuine routable Wi-Fi or Ethernet IPv4 addresses.
+- **Multiple Coexisting Servers**: When multiple hosts broadcast on the same LAN, LANShare keys each server by its unique composite identifier (`server_id`), rendering each workspace separately in discovery lists.
+- **Stale Workspace Eviction**: Announcements unrefreshed for more than 10 seconds are automatically evicted from discovery lists.
+
+---
+
+### Windows Firewall & Network Troubleshooting
+
+- **Firewall Prompt**: The first time you launch `LANShare.bat`, Windows Firewall may ask to allow Python / LANShare on Private Networks. **Allow access** on Private (Wi-Fi/Home/Work) networks.
+- **Connectivity Check**: If peers cannot discover your host, verify that your network profile in Windows Settings is set to **Private Network** (Public networks block inbound UDP/TCP traffic by default).
+- **Diagnostics**: The server provides a `/api/system/firewall-check` diagnostic endpoint reporting the detected primary LAN IPv4 address and advising on Windows Firewall status.
 
